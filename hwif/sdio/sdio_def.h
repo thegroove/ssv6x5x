@@ -144,10 +144,7 @@ struct sdio_scatter_req {
 #define CMD53_ARG_FIXED_ADDRESS 0
 #define CMD53_ARG_INCR_ADDRESS  1
 
-
-#ifdef  CONFIG_FW_ALIGNMENT_CHECK
 #define SDIO_DMA_BUFFER_LEN			2048
-#endif
 
 #ifdef  CONFIG_PM
 #define SDIO_COMMAND_BUFFER_LEN             256 
@@ -183,8 +180,5 @@ struct sdio_scatter_req {
 #define SDIO_READY_FLAG_IDLE		0x2
 #define SDIO_READY_FLAG_BUSY_THRESHOLD	10000
 #define SDIO_READY_FLAG_BUSY_DELAY	5
-
-#define PLATFORM_DEF_DMA_ALIGN_SIZE 32
-#define PLATFORM_DMA_ALIGNED __attribute__ ((aligned(PLATFORM_DEF_DMA_ALIGN_SIZE)))
 
 #endif /* _SDIO_DEF_H_ */

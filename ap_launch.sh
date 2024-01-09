@@ -1,4 +1,4 @@
-#! /bin/bash
+#! /bin/bash -x
 
 
 BLUE='\e[1;34m'
@@ -38,6 +38,9 @@ fi
 dir=$(pwd)
 cd $dir
 
+#echo -e "${YELLOW}load wireless driver...${NC}"
+#./load.sh
+
 #echo -e "${YELLOW}Unoad wireless driver...${NC}"
 #./unload.sh
 #PID=$!
@@ -58,15 +61,15 @@ echo -e "${YELLOW}Config wireless AP...${NC}"
 #rm -rf load_dhcp.sh
 #rm -rf hostapd.conf
 #relpace wlan@@ to real device name
-cp script/template/load_dhcp.sh load_dhcp.sh
+#cp script/template/load_dhcp.sh load_dhcp.sh
 #cp script/template/hostapd.conf hostapd.conf
-awk 'NF' script/template/hostapd.conf | grep -v '#' > hostapd.conf
-awk 'NF' ap.cfg | grep -v '#' >> hostapd.conf
+#awk 'NF' script/template/hostapd.conf | grep -v '#' > hostapd.conf
+#awk 'NF' ap.cfg | grep -v '#' >> hostapd.conf
+ 
+sed -i -r "s/wlan[0-9]+/$devName/g" script/load_dhcp.sh
+sed -i -r "s/wlan[0-9]+/$devName/g" hostapd.conf
 
-sed -i "s/wlan@@/$devName/" load_dhcp.sh
-sed -i "s/wlan@@/$devName/" hostapd.conf
-
-chmod 777 load_dhcp.sh
+chmod 777 script/load_dhcp.sh
 
 #move to right position
 #mv load_dhcp.sh $HOSTPAD_DIR
@@ -103,8 +106,33 @@ function handle_stop() {
         nmcli nm wifi on
     fi
     
-    echo -e "${YELLOW}Shutting down AP.${NC}"
-    ./ap_shutdown.sh
+    #echo "@@killall hostapd..."
+    hostapd_pid=`pgrep hostapd`
+    [ $? -eq 0 ] && (echo "\nKilling hostapd..."; kill INT $hostapd_pid)
+    PID=$!
+    wait $PID
+    sleep 2
+
+    ### kill dhcp server
+    dhcpd_pid=`pgrep dhcpd`
+    [ $? -eq 0 ] && (echo "\nKilling dhcpd..."; kill -KILL $dhcpd_pid)
+    PID=$!
+    wait $PID
+    sleep 2
+
+    ### ifconfig down
+    ifconfig $devName down
+    PID=$!
+    wait $PID
+    sleep 1
+
+    ### unload dirver
+    ./unload.sh
+    PID=$!
+    wait $PID
+    sleep 2
+    
+    echo -e "${YELLOW}done to shutdown AP.${NC}"
 }
         
 if version_great $nmcli_version $chk_nmcli_version; then
@@ -118,7 +146,7 @@ sudo rfkill unblock wlan
 #pushd $HOSTPAD_DIR
 #. ./load_ap.sh
 #$HOSTPAD_DIR/load_dhcp.sh &
-./load_dhcp.sh &
+script/load_dhcp.sh &
 PID=$!
 wait $PID
 
@@ -126,4 +154,4 @@ echo -e "${YELLOW}Load AP...${NC}"
 echo -e "${GREEN}Launch hostapd.${NC}"
 #run hostapd2.0
 #$HOSTPAD_DIR/hostapd -t hostapd.conf
-hostapd -t hostapd.conf
+hostapd -t hostapd.conf 

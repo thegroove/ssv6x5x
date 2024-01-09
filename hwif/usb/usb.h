@@ -20,16 +20,11 @@
 #include <linux/workqueue.h>
 #include <ssv_data_struct.h>
 
-/* debug message */
-#define USB_DBG(fmt, ...)    pr_debug(fmt "\n", ##__VA_ARGS__)
-
 #define FW_START_ADDR				0x00
 
 #define        VENDOR_SPECIFIC_FW_DOWNLOAD             (0xf0)
-#ifdef CONFIG_USB_EP0_RW_REGISTER
 #define        VENDOR_SPECIFIC_REG_RW                  (0x88)
 #define        VENDOR_SPECIFIC_REG_RW_WDATA            (0x99)
-#endif
 
 /* endpoint number */
 #define SSV_EP_CMD               0x01
@@ -51,8 +46,8 @@ struct ssv6xxx_read_reg {
 }__attribute__ ((packed));
 
 struct ssv6xxx_write_reg {
-	u32		addr;
-	u32		value;
+    u32		addr;
+    u32		value;
 }__attribute__ ((packed));
 
 union ssv6xxx_payload {
@@ -86,7 +81,7 @@ struct ssv6xxx_rx_endpoint {
 };
 
 #define SSV_USB_MAX_NR_RECVBUFF (8)
-#define SSV_USB_MIN_NR_RECVBUFF (2)
+#define SSV_USB_MIN_NR_RECVBUFF (1)
 
 struct ssv6xxx_usb_rx_buf {
     struct ssv6xxx_list_node node;

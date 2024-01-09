@@ -2,8 +2,8 @@
 
 echo "@@Unload hostapd..."
 dir=$(pwd)
-cd $dir/script
-./unload_ap.sh
+cd $dir
+script/unload_ap.sh
 
 PID=$!
 wait $PID

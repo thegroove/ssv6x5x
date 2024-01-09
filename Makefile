@@ -7,72 +7,73 @@ CROSS_COMPILE ?= $(HOME)/firmware/output/per-package/linux/host/opt/ext-toolchai
 KBUILD_TOP ?= $(PWD)
 SSV_DRV_PATH ?= $(PWD)
 
-ifeq ($(INSTALL_PATH),)
-INSTALL_PATH := $(PWD)
-endif
-
-include $(KBUILD_TOP)/config_common.mak
 include $(KBUILD_TOP)/config.mak
 
 EXTRA_CFLAGS := -I$(KBUILD_TOP) -I$(KBUILD_TOP)/include
 
-DEF_PARSER_H = $(KBUILD_TOP)/include/ssv_conf_parser.h
-$(shell env ccflags="$(ccflags-y)" $(KBUILD_TOP)/parser-conf.sh $(DEF_PARSER_H))
-
 #------------------------------
 # ssvdevice/
 KERN_SRCS := ssvdevice/ssvdevice.c
-KERN_SRCS += ssvdevice/ssv_cmd.c
+KERN_SRCS += ssvdevice/init.c
+KERN_SRCS += ssvdevice/debugfs_cmd.c
+KERN_SRCS += ssvdevice/rftool/ssv_phy_rf.c
+KERN_SRCS += ssvdevice/ssv_custom_func.c
+KERN_SRCS += ssvdevice/rftool/ssv_efuse.c
+KERN_SRCS += ssvdevice/ssv_version.c
 
-# hci/
-KERN_SRCS += hci/ssv_hci.c
-
-# smac/
-KERN_SRCS += smac/init.c
-KERN_SRCS += smac/dev.c
-KERN_SRCS += smac/regd.c
-KERN_SRCS += smac/wow.c
-KERN_SRCS += smac/hw_scan.c
-
-KERN_SRCS += smac/lib.c
-KERN_SRCS += smac/ap.c
-
-ifeq ($(findstring -DCONFIG_SSV6XXX_DEBUGFS, $(ccflags-y)), -DCONFIG_SSV6XXX_DEBUGFS)
-KERN_SRCS += smac/ssv6xxx_debugfs.c
+# KERN_SRCS += hwif/common/common.c
+KERN_SRCS += hwif/hwif.c
+ifneq ($(CONFIG_HWIF_SUPPORT),2)
+KERN_SRCS += hwif/usb/usb.c
 endif
-
-KERN_SRCS += smac/efuse.c
-KERN_SRCS += smac/ssv_skb.c
-ifeq ($(findstring -DCONFIG_SSV_CTL, $(ccflags-y)), -DCONFIG_SSV_CTL)
-KERN_SRCS += smac/ssv_wifi_ctl.c
-endif
-
-KERN_SRCS += smac/hal/hal.c
-ifeq ($(findstring -DSSV_SUPPORT_SSV6006, $(ccflags-y)), -DSSV_SUPPORT_SSV6006)
-KERN_SRCS += smac/hal/ssv6006c/ssv6006_common.c
-KERN_SRCS += smac/hal/ssv6006c/ssv6006C_mac.c
-KERN_SRCS += smac/hal/ssv6006c/ssv6006_phy.c
-KERN_SRCS += smac/hal/ssv6006c/ssv6006_turismoC.c
-endif
-
-# hwif/hal/
-KERN_SRCS += hwif/hal/hwif_hal.c
-ifeq ($(findstring -DSSV_SUPPORT_SSV6006, $(ccflags-y)), -DSSV_SUPPORT_SSV6006)
-KERN_SRCS += hwif/hal/ssv6006c/ssv6006C_hwif.c
-endif
-
-ifeq ($(findstring -DSSV_SUPPORT_SDIO, $(ccflags-y)), -DSSV_SUPPORT_SDIO)
-# hwif/sdio/
+ifneq ($(CONFIG_HWIF_SUPPORT),1)
 KERN_SRCS += hwif/sdio/sdio.c
 endif
 
-ifeq ($(findstring -DSSV_SUPPORT_USB, $(ccflags-y)), -DSSV_SUPPORT_USB)
-# hwif/usb
-KERN_SRCS += hwif/usb/usb.c
+KERN_SRCS += hci/ssv_hci.c
+
+KERN_SRCS += utils/debugfs.c
+KERN_SRCS += utils/ssv_netlink_ctl.c
+
+ifeq ($(CONFIG_WPA_SUPPLICANT_CTL),y)
+KERN_SRCS += utils/ssv_wpas_ctl.c
+endif
+
+KERN_SRCS += utils/ssv_alloc_skb.c
+
+#.fmac/
+KERN_SRCS += fmac/cfg_ops.c
+KERN_SRCS += fmac/fmac.c
+KERN_SRCS += fmac/fmac_mod_params.c
+KERN_SRCS += fmac/fmac_cmds.c
+KERN_SRCS += fmac/fmac_msg_tx.c
+KERN_SRCS += fmac/fmac_msg_rx.c
+KERN_SRCS += fmac/fmac_utils.c
+KERN_SRCS += fmac/fmac_strs.c
+KERN_SRCS += fmac/fmac_tx.c
+KERN_SRCS += fmac/fmac_rx.c
+KERN_SRCS += fmac/ipc_host.c
+KERN_SRCS += fmac/netdev_ops.c
+
+KERN_SRCS += ssvdevice/rftool/ssv_rftool.c
+KERN_SRCS += ssvdevice/rftool/ssv_rftool_msg.c
+
+# nimble/
+KERN_SRCS += ble/nimble/nimble.c
+KERN_SRCS += ble/nimble/nimble_msg.c
+
+ifeq ($(CONFIG_FMAC_BRIDGE),y)
+KERN_SRCS += fmac/fmac_bridge.c
+endif
+
+# ble-hci/
+ifeq ($(CONFIG_BLE),y)
+KERN_SRCS += ble/ble_hci/ble_hci.c
+KERN_SRCS += ble/ble_hci/ble_hci_msg.c
+KERN_SRCS += ble/ble_hci/hcidev_ops.c
 endif
 
 #------------------------------
-
 KERN_SRCS += $(KMODULE_NAME)-generic-wlan.c
 
 $(KMODULE_NAME)-y += $(KERN_SRCS_S:.S=.o)
@@ -80,9 +81,20 @@ $(KMODULE_NAME)-y += $(KERN_SRCS:.c=.o)
 
 obj-$(CONFIG_SSV6X5X) += $(KMODULE_NAME).o
 
-.PHONY: all ver modules clean
+ifeq ($(CONFIG_PRE_ALLOC_SKB),2)
+	KMODULE_PRE_ALLOCATE_NAME = pre-allocate
+	PRE_ALLOC_SRCS += utils/pre_alloc_skb.c
+	PRE_ALLOC_SRCS += utils/pre_allocate.c
+	$(KMODULE_PRE_ALLOCATE_NAME)-y += $(PRE_ALLOC_SRCS:.c=.o)
+	obj-$(CONFIG_SSV6X5X) += $(KMODULE_PRE_ALLOCATE_NAME).o
+else
+	ifeq ($(CONFIG_PRE_ALLOC_SKB),1)
+		KERN_SRCS += utils/pre_alloc_skb.c
+		KERN_SRCS += utils/pre_allocate.c
+	endif
+endif
 
-all: $(MOD_DEF_H) modules
+all: modules
 
 modules:
 	$(MAKE) -C $(KSRC) M=$(SSV_DRV_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
@@ -90,13 +102,5 @@ modules:
 strip:
 	$(CROSS_COMPILE)strip $(KMODULE_NAME).ko --strip-unneeded
 
-install:
-	$(MAKE) INSTALL_MOD_DIR=$(INSTALL_PATH) -C $(KSRC) M=$(SSV_DRV_PATH) modules_install
-	depmod -a
-
 clean:
 	$(MAKE) -C $(KSRC) M=$(SSV_DRV_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean
-	@rm -rf $(MOD_DEF_H)
-
-$(MOD_DEF_H): config.mak config_common.mak
-	env ccflags="$(ccflags-y)" ./genconf.sh $@

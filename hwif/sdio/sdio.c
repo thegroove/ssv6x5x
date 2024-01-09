@@ -18,7 +18,6 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
-#include <linux/platform_device.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
 #include <linux/mmc/sdio.h>
@@ -27,34 +26,42 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
 #include <linux/skbuff.h>
+#include <linux/netdevice.h>
 #include <linux/delay.h>
 #include <linux/pm_runtime.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
-#include <linux/printk.h>
-#else
-#include <linux/kernel.h>
-#endif
+
+#include "ssv_cfg.h"
 
 #include <hwif/hwif.h>
 #include "sdio_def.h"
-#include <ssv_chip_id.h>
-#include "hwif/hal/hwif_hal.h"
-
 #include "sdio.h"
+#include "ssv_debug.h"
+#include "utils/ssv_alloc_skb.h"
+
+// #include "rf_phy/6030B1/ssv_calibration.h"
+// #include "hwif/common/common.h"
+
+#ifndef HWIF_DIS_FW_DOWNLOAD
+#include "ssv6x5x-sw.h"
+#include "ssv6x5x-sw_2.h"
+#endif
+
 #define LOW_SPEED_SDIO_CLOCK		(25000000)
 #define HIGH_SPEED_SDIO_CLOCK		(50000000)
 
-#define MAX_RX_FRAME_SIZE 0x900
 #define MAX_REG_RETRY_CNT	(3)
 
 #define SSV_VENDOR_ID	0x3030
 #define SSV_CABRIO_DEVID	0x3030
 
+#define SSV_VENDOR_ID_6030		(0x5356)
+#define SSV_DEVICE_ID_6030		(0x6030)
+
 #define CHECK_IO_RET(GLUE, RET) \
     do { \
         if (RET) { \
             if ((++((GLUE)->err_count)) > MAX_ERR_COUNT) \
-                printk(KERN_ERR "MAX SDIO Error\n"); \
+                SSV_LOG_DBG("MAX SDIO Error\n"); \
         } else \
             (GLUE)->err_count = 0; \
     } while (0)
@@ -63,30 +70,16 @@
 
 struct ssv6xxx_sdio_glue
 {
+    void                         *plat_hw;
     struct device                *dev;
-    struct platform_device       *core;
-    struct ssv6xxx_platform_data *p_wlan_data;
-    struct ssv6xxx_platform_data  tmp_data;
-#ifdef CONFIG_MMC_DISALLOW_STACK
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
+    bool                          is_enabled;
+    atomic_t                      irq_handling;
     PLATFORM_DMA_ALIGNED u8 rreg_data[4];
     PLATFORM_DMA_ALIGNED u8 wreg_data[8];
     PLATFORM_DMA_ALIGNED u32 brreg_data[MAX_BURST_READ_REG_AMOUNT];
     PLATFORM_DMA_ALIGNED u8 bwreg_data[MAX_BURST_WRITE_REG_AMOUNT][8];
     PLATFORM_DMA_ALIGNED u32 aggr_readsz;
     PLATFORM_DMA_ALIGNED u8 dmaData[SDIO_DMA_BUFFER_LEN];
-#else
-    u8 rreg_data[4];
-    u8 wreg_data[8];
-    u32 brreg_data[MAX_BURST_READ_REG_AMOUNT];
-    u8 bwreg_data[MAX_BURST_WRITE_REG_AMOUNT][8];
-    u32 aggr_readsz;
-#endif
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u8 dmaData[SDIO_DMA_BUFFER_LEN];
-#endif
-#endif
     /* for ssv SDIO */
     unsigned int                dataIOPort;
     unsigned int                regIOPort;
@@ -97,31 +90,33 @@ struct ssv6xxx_sdio_glue
 	struct workqueue_struct *wq;
 	struct ssv6xxx_sdio_work_struct rx_work;
 	//struct tasklet_struct rx_tasklet;
-	u32 *rx_pkt;
-	u32 *rx_isr_cnt;
+	u32 rx_pkt;
+	u32 rx_isr_cnt;
     u32 recv_cnt;
 	void *rx_cb_args;
     int (*rx_cb)(struct sk_buff *rx_skb, void *args);
     int (*is_rx_q_full)(void *);
-    struct ssv_hwif_hal_ops hwif_hal_ops;
+    u32 tx_pkt;
 };
 
+extern struct ssv6xxx_cfg ssv_cfg;
+
+#if 0
 static void ssv6xxx_high_sdio_clk(struct sdio_func *func);
+#endif
 static void ssv6xxx_low_sdio_clk(struct sdio_func *func);
-static void ssv6xxx_do_sdio_reset_reinit(struct ssv6xxx_platform_data *pwlan_data, 
-        struct sdio_func *func, struct ssv6xxx_sdio_glue *glue);
+static void ssv6xxx_high_sdio_clk(struct sdio_func *func);
+static void ssv6xxx_do_sdio_reset_reinit(struct sdio_func *func, struct ssv6xxx_sdio_glue *glue);
 static void ssv6xxx_sdio_direct_int_mux_mode(struct ssv6xxx_sdio_glue *glue, bool enable);
 
 #if 1
-static bool _is_glue_invalid(struct ssv6xxx_sdio_glue *glue);
-#define IS_GLUE_INVALID(glue)  _is_glue_invalid(glue)
+static bool _ssv_is_glue_invalid(struct ssv6xxx_sdio_glue *glue);
+#define IS_GLUE_INVALID(glue)  _ssv_is_glue_invalid(glue)
 
 #else
 #define IS_GLUE_INVALID(glue)  \
       (   (glue == NULL) \
        || (glue->dev_ready == false) \
-       || (   (glue->p_wlan_data != NULL) \
-           && (glue->p_wlan_data->is_enabled == false)) \
        || (glue->err_count > MAX_ERR_COUNT))
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
@@ -131,25 +126,22 @@ static const struct sdio_device_id ssv6xxx_sdio_devices[] =
 #endif
 {
     { SDIO_DEVICE(SSV_VENDOR_ID, SSV_CABRIO_DEVID) },
+    { SDIO_DEVICE(SSV_VENDOR_ID_6030, SSV_DEVICE_ID_6030) },
     {}
 };
 MODULE_DEVICE_TABLE(sdio, ssv6xxx_sdio_devices);
-static bool _is_glue_invalid(struct ssv6xxx_sdio_glue *glue)
+
+static bool _ssv_is_glue_invalid(struct ssv6xxx_sdio_glue *glue)
 {
-    if(NULL==glue)
+    if(NULL == glue)
         return true;
 
-    if(false==glue->dev_ready)
+    if(false == glue->dev_ready)
         return true;
 
-    if(NULL!=glue->p_wlan_data)
-    {
-        if(glue->p_wlan_data->is_enabled == false)
-        {
-            return true;
-        }
-    }
-    
+    if (false == glue->is_enabled)
+        return false;
+
     if(glue->err_count > MAX_ERR_COUNT)
     {
         return true;
@@ -157,21 +149,12 @@ static bool _is_glue_invalid(struct ssv6xxx_sdio_glue *glue)
 
     return false;
 }
-static bool ssv6xxx_is_ready (struct device *child)
-{
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-
-    if (IS_GLUE_INVALID(glue))
-        return false;
-
-    return glue->dev_ready;
-} // end of - ssv6xxx_is_ready -
-
+#if (HWIF_SUPPORT == 2)
 static int ssv6xxx_sdio_cmd52_read(struct device *child, u32 addr,
         u32 *value)
 {
     int ret = -1;
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func = NULL;
 
     if (IS_GLUE_INVALID(glue))
@@ -190,11 +173,13 @@ static int ssv6xxx_sdio_cmd52_read(struct device *child, u32 addr,
     return ret;
 }
 
-static int _ssv6xxx_sdio_cmd52_write(struct ssv6xxx_sdio_glue *glue, u32 addr,
-        u32 value)
+static int _ssv6xxx_sdio_cmd52_write(struct ssv6xxx_sdio_glue *glue, u32 addr, u32 value)
 {
     int ret = -1;
     struct sdio_func *func = NULL;
+
+    if (IS_GLUE_INVALID(glue))
+		return ret;
 
     if ( glue != NULL )
     {
@@ -207,11 +192,10 @@ static int _ssv6xxx_sdio_cmd52_write(struct ssv6xxx_sdio_glue *glue, u32 addr,
     return ret;
 }
 
-static int ssv6xxx_sdio_cmd52_write(struct device *child, u32 addr,
-        u32 value)
+static int ssv6xxx_sdio_cmd52_write(struct device *child, u32 addr, u32 value)
 {
     int ret = -1;
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
 
     if (IS_GLUE_INVALID(glue))
 		return ret;
@@ -222,27 +206,44 @@ static int ssv6xxx_sdio_cmd52_write(struct device *child, u32 addr,
     }
     return ret;
 }
-
-static int __must_check __ssv6xxx_sdio_read_reg (struct ssv6xxx_sdio_glue *glue, u32 addr,
+#endif
+static int __ssv6xxx_sdio_read_reg (struct ssv6xxx_sdio_glue *glue, u32 addr,
                                                  u32 *buf)
 {    
     int ret = (-1);
     struct sdio_func *func = NULL;
-#ifdef CONFIG_MMC_DISALLOW_STACK
     u8 *datap = glue->rreg_data;
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u8 data[4];
-#else
-    u8 data[4];
-#endif
-    u8 *datap = data;
-#endif
+    
+    if (IS_GLUE_INVALID(glue)) {
+		return -ENODEV;
+    }
 
-    if (IS_GLUE_INVALID(glue))
-		return ret;
-   
-    //dev_err(&func->dev, "sdio read reg device[%08x] parent[%08x]\n",child,child->parent);
+    //dev_err(&func->dev, "sdio read reg device[%08x] \n",child);
+
+#ifdef SDIO_CMD52_CHK_TX_RESOURCE
+    ///@FIXME: Change to use CMD52 to check TX resource.
+    ///CMD53: 0x08C10050
+    ///CMD52: 0x9F
+    if(0x08c10050 == addr)
+    {
+        u8 val = 0;
+        func = dev_to_sdio_func(glue->dev);
+
+        sdio_claim_host(func);
+        val = sdio_readb(func, 0x9f, &ret);
+        sdio_release_host(func);
+        CHECK_IO_RET(glue, ret);
+        if(0 == val)
+        {
+            *buf = 0;
+        }
+        else
+        {
+            *buf = (((u32)val)<<16);
+        }
+        return ret;
+    }
+#endif
 
     if ( glue != NULL )
     {
@@ -295,59 +296,30 @@ io_err:
     return ret;
 }
 
-static int __must_check ssv6xxx_sdio_read_reg(struct device *child, u32 addr,
+static int ssv6xxx_sdio_read_reg(struct device *child, u32 addr,
         u32 *buf)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-	int i, ret;
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
+    //int i, ret;
+    int ret;
 
-	for (i = 0; i < MAX_REG_RETRY_CNT; i++) {
+	//for (i = 0; i < MAX_REG_RETRY_CNT; i++) {
 		ret = __ssv6xxx_sdio_read_reg(glue, addr, buf);
 		if (!ret)
 			return ret;
 	
-	}
+	//}
 	
-	HWIF_DBG_PRINT(glue->p_wlan_data, "%s: Fail to read register, addr 0x%08x\n", __FUNCTION__, addr);
-
+	SSV_LOG_DBG("%s: Fail to read register, addr 0x%08x\n", __FUNCTION__, addr);
     return ret;
 }
 
-#ifdef ENABLE_WAKE_IO_ISR_WHEN_HCI_ENQUEUE
-static int ssv6xxx_sdio_trigger_tx_rx (struct device *child)
-{
-    int ret = (-1);
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func;
-    struct mmc_host *host;
-
-    if (IS_GLUE_INVALID(glue))
-        return ret;
-
-    func = dev_to_sdio_func(glue->dev);
-    host = func->card->host;
-    // Wake up SDIO IRQ handler which would call our ISR.
-    mmc_signal_sdio_irq(host);
-
-    return 0;
-}
-#endif // ENABLE_WAKE_IO_ISR_WHEN_HCI_ENQUEUE
-
-static int __must_check __ssv6xxx_sdio_write_reg (struct ssv6xxx_sdio_glue *glue, u32 addr,
+static int __ssv6xxx_sdio_write_reg (struct ssv6xxx_sdio_glue *glue, u32 addr,
                                                   u32 buf)
 {
     int ret = (-1);
     struct sdio_func *func = NULL;
-#ifdef CONFIG_MMC_DISALLOW_STACK
     u8 *datap = glue->wreg_data;
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u8 data[8];
-#else
-    u8 data[8];
-#endif
-    u8 *datap = data;
-#endif
 
     if (IS_GLUE_INVALID(glue))
         return ret;
@@ -387,10 +359,9 @@ static int __must_check __ssv6xxx_sdio_write_reg (struct ssv6xxx_sdio_glue *glue
     return ret;
 }
 
-static int __must_check ssv6xxx_sdio_write_reg(struct device *child, u32 addr,
-        u32 buf)
+static int ssv6xxx_sdio_write_reg(struct device *child, u32 addr, u32 buf)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
    	int i, ret;
 
 	for (i = 0; i < MAX_REG_RETRY_CNT; i++) {
@@ -405,172 +376,86 @@ static int __must_check ssv6xxx_sdio_write_reg(struct device *child, u32 addr,
 	    }
 	}
 	
-	HWIF_DBG_PRINT(glue->p_wlan_data, "%s: Fail to write register, addr 0x%08x, value 0x%08x\n", __FUNCTION__, addr, buf);
-
+	SSV_LOG_DBG("%s: Fail to write register, addr 0x%08x, value 0x%08x\n", __FUNCTION__, addr, buf);
     return ret;
 }
 
-// Burst read from SSV6XXX's registers 
-static int __must_check ssv6xxx_sdio_burst_read_reg(struct device *child, u32 *addr,
-        u32 *buf, u8 reg_amount)
-{   
-#if 1
-    printk("not support sdio burst read/write register\n");
-    return 0;
-#else
-    int ret = (-1);
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func ;
-#ifdef CONFIG_MMC_DISALLOW_STACK
-    u32 *datap = glue->brreg_data;
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u32 data[MAX_BURST_READ_REG_AMOUNT]={0};
-#else
-    u32 data[MAX_BURST_READ_REG_AMOUNT]={0};
-#endif
-    u32 *datap = data;
-#endif
-    u8 i = 0;
-
-    if (IS_GLUE_INVALID(glue))
-        return ret;
-
-    if (reg_amount > MAX_BURST_READ_REG_AMOUNT)
-    {
-        HWIF_DBG_PRINT(glue->p_wlan_data, "The amount of sdio burst-read register must <= %d\n", 
-				MAX_BURST_READ_REG_AMOUNT);
-        return ret;
-    }
-
-    if ( glue != NULL )
-    {
-        func = dev_to_sdio_func(glue->dev);
-        sdio_claim_host(func);
-      
-        //one input is 4 bytes address 
-        for (i=0; i<reg_amount; i++)
-        {
-            memcpy(&datap[i], &addr[i], 4);
-        }        
-
-        ret = sdio_memcpy_toio(func, IO_REG_BURST_RD_PORT_REG, datap, reg_amount*4);
-
-        if (WARN_ON(ret))
-        {
-            dev_err(child->parent, "sdio burst-read reg write address failed (%d)\n", ret);
-            goto io_err;
-        }
-
-        ret = sdio_memcpy_fromio(func, datap, IO_REG_BURST_RD_PORT_REG, reg_amount*4);
-        if (WARN_ON(ret))
-        {
-            dev_err(child->parent, "sdio burst-read reg from I/O failed (%d)\n",ret);
-        	goto io_err;
-        }               
-
-        //one output is 4bytes data
-        if(ret == 0)
-            memcpy(buf, datap, reg_amount*4);
-        else
-            memset(buf, 0xffffffff, reg_amount*4);
-        
-io_err:
-        sdio_release_host(func);
-        CHECK_IO_RET(glue, ret);       
-    }
-    else
-    {
-        dev_err(child->parent, "sdio burst-read reg glue == NULL!!!\n");
-    }
-    return ret;
-#endif
-}
-
-// Burst write to SSV6XXX's registers 
-static int __must_check ssv6xxx_sdio_burst_write_reg(struct device *child, u32 *addr,
-        u32 *buf, u8 reg_amount)
+#if 0
+static void ssv6xxx_sdio_save_calibr_result(struct device *child)
 {
-#if 1
-    printk("not support sdio burst read/write register\n");
-    return 0;
-#else
-    int ret = (-1);
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func ;
-#ifdef CONFIG_MMC_DISALLOW_STACK
-    u8 (*datap)[8] = glue->bwreg_data;
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u8 data[MAX_BURST_WRITE_REG_AMOUNT][8]={{0},{0}};
-#else
-    u8 data[MAX_BURST_WRITE_REG_AMOUNT][8]={{0},{0}};
-#endif
-    u8 (*datap)[8] = data;
-#endif
-    u8 i = 0;
-    
-    if (IS_GLUE_INVALID(glue))
-        return ret;
+    int i;
+    u32 regval = 0;
+    ssv_cabrio_reg *pcalib = NULL;
+    u32 calib_size = ssv_get_calibr_rsult_size();
+    ssv_get_calibr_rsult_addr(&pcalib);
 
-    if (reg_amount > MAX_BURST_WRITE_REG_AMOUNT)
+    //SSV_LOG_DBG("sdio save\n");
+    for(i = 0; i < calib_size/sizeof(ssv_cabrio_reg); i++)
     {
-        HWIF_DBG_PRINT(glue->p_wlan_data, "The amount of sdio burst-read register must <= %d\n", 
-				MAX_BURST_WRITE_REG_AMOUNT);
-        return ret;
+        ssv6xxx_sdio_read_reg(child, pcalib->address, &regval);
+        pcalib->data = regval;
+        //SSV_LOG_DBG("%08X: %08X\n", pcalib->address, pcalib->data);
+        pcalib++;
     }
-    
-    if ( glue != NULL )
-    {
-        func = dev_to_sdio_func(glue->dev);
-        sdio_claim_host(func);      
 
-        //8byte for one output: 4bytes address + 4bytes values
-        for (i=0; i<reg_amount; i++)
-        {
-            // 4 bytes address        
-            datap[i][0] = (addr[i] >> ( 0 )) &0xff;
-            datap[i][1] = (addr[i] >> ( 8 )) &0xff;
-            datap[i][2] = (addr[i] >> ( 16 )) &0xff;
-            datap[i][3] = (addr[i] >> ( 24 )) &0xff;
-
-            // 4 bytes data
-            datap[i][4] = (buf[i] >> ( 0 )) &0xff;
-            datap[i][5] = (buf[i] >> ( 8 )) &0xff;
-            datap[i][6] = (buf[i] >> ( 16 )) &0xff;
-            datap[i][7] = (buf[i] >> ( 24 )) &0xff;            
-        }        
-
-        ret = sdio_memcpy_toio(func, IO_REG_BURST_WR_PORT_REG, datap, reg_amount*8);
-  
-        sdio_release_host(func);
-        CHECK_IO_RET(glue, ret);
-    }
-    else
-    {
-        dev_err(child->parent, "sdio burst-write reg glue == NULL!!!\n");
-    }
-    return ret;
-#endif
 }
 
+static void ssv6xxx_sdio_restore_calibration(struct device *child)
+{
+    int i;
+    ssv_cabrio_reg *pcalib = NULL;
+    u32 calib_size = ssv_get_calibr_rsult_size();
+    ssv_get_calibr_rsult_addr(&pcalib);
+
+    //SSV_LOG_DBG("sdio restore\n");
+    for(i = 0; i < calib_size/sizeof(ssv_cabrio_reg); i++)
+    {
+        ssv6xxx_sdio_write_reg(child, pcalib->address, pcalib->data);
+        //SSV_LOG_DBG("%08X: %08X\n", pcalib->address, pcalib->data);
+        pcalib++;
+    }
+}
+#endif
+
+
+static void ssv6xxx_sdio_load_fw_post_config_hwif(struct device *child)
+{
+
+    struct ssv6xxx_sdio_glue *glue;
+    struct sdio_func *func=NULL;
+
+    glue = dev_get_drvdata(child);
+    if (!IS_GLUE_INVALID(glue)) {
+        func = dev_to_sdio_func(glue->dev);
+		ssv6xxx_high_sdio_clk(func);
+	}
+}
+
+////load firmware function +++
+#ifndef HWIF_DIS_FW_DOWNLOAD
 // Write to SSV6XXX's SRAM 
 static int ssv6xxx_sdio_write_sram(struct device *child, u32 addr, u8 *data, u32 size)
 {
     int     ret = -1;
+    
     struct ssv6xxx_sdio_glue *glue;
     struct sdio_func *func=NULL;
     
-    glue = dev_get_drvdata(child->parent);
+    glue = dev_get_drvdata(child);
 
     if (IS_GLUE_INVALID(glue))
         return ret;
 
     func = dev_to_sdio_func(glue->dev);
     sdio_claim_host(func);
+
+//SSV_LOG_DBG("[SDIO] ssv6xxx_sdio_write_sram addr = 0x%x, len = %d\n", addr, size);
+//SSV_LOG_DBG(_DBG("[SDIO] %x %x %x %x %x %x %x %x .... %x %x %x %x %x %x %x %x\n", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[804], data[805], data[806], data[807], data[808], data[809], data[810], data[811]);
+
     do {
         //Setting SDIO DMA address
-        if (ssv6xxx_sdio_write_reg(child,0xc0000860,addr)) ;
+        // if (ssv6xxx_sdio_write_reg(child,0xc0000860,addr)) ;
+        if (ssv6xxx_sdio_write_reg(child,0x08c10260,addr)) ;
     
         // Set data path to DMA to SRAM
         sdio_writeb(func, 0x2, REG_Fn1_STATUS, &ret);
@@ -600,27 +485,486 @@ static void ssv6xxx_sdio_load_fw_pre_config_hwif(struct device *child)
 {
     struct ssv6xxx_sdio_glue *glue;
     struct sdio_func *func=NULL;
-
-    glue = dev_get_drvdata(child->parent);
+ 
+    glue = dev_get_drvdata(child);
     if (!IS_GLUE_INVALID(glue)) {
         func = dev_to_sdio_func(glue->dev);
 		ssv6xxx_low_sdio_clk(func);
 	}
 }
 
-static void ssv6xxx_sdio_load_fw_post_config_hwif(struct device *child)
-{
-#ifndef SDIO_USE_SLOW_CLOCK
-    struct ssv6xxx_sdio_glue *glue;
-    struct sdio_func *func=NULL;
+//new
+#define FW_CHECKSUM_INIT                    (0x12345678)
+#define FW_BLOCK_SIZE                       0x800
+#define CHECKSUM_BLOCK_SIZE                 1024
+//#define FW_CHECKSUM_ADDR 0x01032d24
+#define MAX_FIRMWARE_BLOCKS_CNT 3
+#define MAC_FIRMWARE_BLOCKS_LEN 8
 
-    glue = dev_get_drvdata(child->parent);
-    if (!IS_GLUE_INVALID(glue)) {
-        func = dev_to_sdio_func(glue->dev);
-		ssv6xxx_high_sdio_clk(func);
-	}
-#endif // SDIO_USE_SLOW_CLOCK
+//#define FIRMWARE_DOWNLOAD 0xf0
+//#define MAX_USB_BLOCK 512
+//#define FW_BLOCK_SIZE MAX_USB_BLOCK
+
+struct ssv6xxx_block_info {
+    u32 start_addr;
+    u32 len;
+};
+
+struct ssv6xxx_fw_info {
+    struct ssv6xxx_block_info block[MAX_FIRMWARE_BLOCKS_CNT];
+    u32 block_num;
+    u32 check_sum;
+};
+
+static struct ssv6xxx_fw_info fw_info;
+
+
+static int ssv6xxx_read_fw_block(char *buf, int len, void *image)
+{
+    struct file *fp = (struct file *)image;
+    int rdlen;
+
+    if (!image)
+        return 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+    rdlen = kernel_read(fp, buf, len, &fp->f_pos);
+#else
+    rdlen = kernel_read(fp, fp->f_pos, buf, len);
+    if (rdlen > 0)
+        fp->f_pos += rdlen;
+#endif
+
+    return rdlen;
 }
+
+static u32 ssv6xxx_write_firmware_to_sram(struct device *child, void *fw_buffer,
+        void *fw_fp, int fw_len, u32 sram_start_addr, u8 openfile, bool need_checksum, bool *write_sram_err)
+{
+    int ret = 0, i = 0;
+    u32 len = 0, total_len = 0;
+    u32 sram_addr = sram_start_addr;
+    u32 *fw_data32 = NULL;
+    u32 fw_res_size = fw_len;
+    u32 rsize = 0;
+    u32 checksum = 0;
+    u8 *pt=NULL;
+
+    SSV_LOG_DBG("Writing firmware to SSV6XXX...\n");
+    while (fw_res_size) { // load fw block size
+        memset(fw_buffer, 0xA5, CHECKSUM_BLOCK_SIZE);
+		rsize = (fw_res_size>CHECKSUM_BLOCK_SIZE)?CHECKSUM_BLOCK_SIZE:fw_res_size;
+        if (openfile) {
+            //((struct file *)fw_fp)->f_pos = fw_offset;
+            if (!(len = ssv6xxx_read_fw_block((char*)fw_buffer, rsize, fw_fp))) {
+                break;
+            }
+        } else {
+            memcpy((void *)fw_buffer, (const void *)fw_fp, rsize);
+            pt=(u8 *)(fw_fp);
+            fw_fp = (void *)(pt+CHECKSUM_BLOCK_SIZE);
+        }
+
+        fw_res_size -= rsize;
+        total_len += rsize;
+
+        if ((ret = ssv6xxx_sdio_load_firmware(child, sram_addr, (u8 *)fw_buffer, CHECKSUM_BLOCK_SIZE)) != 0) {
+            *write_sram_err = true;
+            goto out;
+        }
+
+        // checksum
+        if (need_checksum) {
+            fw_data32 = (u32 *)fw_buffer;
+            for (i = 0; i < (CHECKSUM_BLOCK_SIZE / sizeof(u32)); i++) 
+                checksum += fw_data32[i];
+        }
+
+        sram_addr += CHECKSUM_BLOCK_SIZE;
+    }
+
+out:
+    return checksum;
+}
+
+static int ssv6xxx_get_firmware_info(void *fw_fp, u8 openfile)
+{
+    int offset = 0;
+    int i = 0, len = 0;
+    u8 buf[MAX_FIRMWARE_BLOCKS_CNT * MAC_FIRMWARE_BLOCKS_LEN];
+    u32 fw_block_info_len = 0;
+    u32 start_addr = 0, fw_block_len = 0;
+
+    memset(buf, 0, MAX_FIRMWARE_BLOCKS_CNT * MAC_FIRMWARE_BLOCKS_LEN);
+    if (openfile) {
+        // reset file pos
+        ((struct file *)fw_fp)->f_pos = 0;
+
+        // fw info len, 4 byte
+        if (!(len = ssv6xxx_read_fw_block((char *)&fw_info.block_num, sizeof(u32), fw_fp))) {
+            offset = -1;
+            goto out;
+        }
+
+        // fw block info
+        fw_block_info_len = fw_info.block_num * MAC_FIRMWARE_BLOCKS_LEN;
+        if (!(len = ssv6xxx_read_fw_block((u8 *)buf, fw_block_info_len, fw_fp))) {
+            offset = -1;
+            goto out;
+        }
+
+    } else {
+        memcpy(&fw_info.block_num, (u8 *)fw_fp, (sizeof(u32)));
+        fw_block_info_len = fw_info.block_num * MAC_FIRMWARE_BLOCKS_LEN;
+        memcpy((u8 *)buf, (u8 *)fw_fp+sizeof(u32), fw_block_info_len);
+    }
+
+    // parse fw block info
+    for (i = 0; i < fw_info.block_num; i++) {
+        start_addr =   (buf[i*8+0] << 0) | (buf[i*8+1] << 8) | (buf[i*8+2] << 16) | (buf[i*8+3] << 24); 
+        fw_block_len = (buf[i*8+4] << 0) | (buf[i*8+5] << 8) | (buf[i*8+6] << 16) | (buf[i*8+7] << 24); 
+        fw_info.block[i].len = fw_block_len;
+        fw_info.block[i].start_addr = start_addr;
+    }
+    fw_info.check_sum = 0;
+    offset = 4 + fw_block_info_len;
+
+out:
+    return offset;
+}
+
+static void *ssv6xxx_open_firmware(char *user_mainfw)
+{
+    struct file *fp;
+
+    fp = filp_open(user_mainfw, O_RDONLY, 0);
+    if (IS_ERR(fp))
+    {
+        fp = NULL;
+    }
+
+    return fp;
+}
+
+static void ssv6xxx_close_firmware(void *image)
+{
+    if (image)
+    {
+        filp_close((struct file *)image, NULL);
+    }
+}
+
+static int _ssv6xxx_sdio_load_firmware(struct device *child, u8 *firmware_name, bool openfile)
+{
+    int ret = 0;
+    u8   *fw_buffer = NULL;
+    void *fw_fp = NULL;
+    void *fw_fp_h = (1 == ssv_cfg.firmware_choice)?(void *)ssv6x5x_sw_bin:(void *)ssv6x5x_sw_2_bin;
+    u32   checksum = FW_CHECKSUM_INIT;
+    u32   retry_count = 1;
+    int fw_start_offset = 0, fw_pos = 0;
+    int fw_block_idx = 0;
+    bool write_sram_err = false;
+    u8 *pt=NULL;
+    int fw_len = (int) ssv6x5x_sw_bin_len; //To avoid compile error.
+    fw_len++;
+
+    // Load firmware
+    if(openfile)
+    {
+        fw_fp = ssv6xxx_open_firmware(firmware_name);
+        if (!fw_fp) {
+            SSV_LOG_DBG("failed to find firmware (%s)\n", firmware_name);
+            ret = -1;
+            goto out;
+        }
+    }
+    else
+    {
+        fw_fp = (void *)fw_fp_h;
+    }
+
+    fw_start_offset = ssv6xxx_get_firmware_info(fw_fp, openfile);
+    if (fw_start_offset < 0) {
+        SSV_LOG_DBG("Failed to get firmware information\n");
+        ret = -1;
+        goto out;
+    }
+
+    // Allocate buffer firmware aligned with FW_BLOCK_SIZE and padding with 0xA5 in empty space.
+    fw_buffer = (u8 *)kzalloc(FW_BLOCK_SIZE, GFP_KERNEL);
+    if (fw_buffer == NULL) {
+        SSV_LOG_DBG("Failed to allocate buffer for firmware.\n");
+        ret = -1;
+        goto out;
+    }
+
+    do {
+        // initial value
+#ifdef HOST_CALCULATE_CHECKSUM
+        u32 fw_checksum = FW_CHECKSUM_INIT;
+#endif
+        checksum = FW_CHECKSUM_INIT;
+        for (fw_block_idx = 0; fw_block_idx < fw_info.block_num; fw_block_idx++)
+        {
+            // calculate the fw block position
+            if (fw_block_idx == 0)
+                fw_pos += fw_start_offset;
+            else
+                fw_pos += fw_info.block[fw_block_idx-1].len;
+
+            if (openfile)
+                ((struct file *)fw_fp)->f_pos = fw_pos;
+            else {
+                fw_fp = (void *)fw_fp_h;
+                pt=(u8 *)(fw_fp);
+                fw_fp = (void *)(pt+fw_pos);
+            }
+
+            //SSV_LOG_DBG(_DBG("\nblock %d ssv6xxx_write_firmware_to_sram addr = 0x%x, len = %d\n", fw_block_idx, fw_info.block[fw_block_idx].start_addr, fw_info.block[fw_block_idx].len);
+            checksum += ssv6xxx_write_firmware_to_sram(child, fw_buffer, fw_fp, fw_info.block[fw_block_idx].len, fw_info.block[fw_block_idx].start_addr, openfile, ((fw_block_idx == 1) ? false : true), &write_sram_err);
+
+            if (write_sram_err) {
+                SSV_LOG_DBG("Firmware \"%s\" fail to write sram.\n", firmware_name);
+                ret = -1;
+                goto out;
+            }
+
+#ifdef HOST_CALCULATE_CHECKSUM
+            {  //calculate checksum on driver
+                int j;
+                uint32_t sram_addr = fw_info.block[fw_block_idx].start_addr;
+                uint32_t sram_size = ((fw_info.block[fw_block_idx].len-1)/CHECKSUM_BLOCK_SIZE)*CHECKSUM_BLOCK_SIZE+CHECKSUM_BLOCK_SIZE;
+                //SSV_LOG_DBG("idx = %d/%d,  fw_len = 0x%x\n", fw_block_idx, fw_info.block_num, fw_info.block[fw_block_idx].len);
+                //SSV_LOG_DBG("sram_size = 0x%x\n", sram_size);
+                if(fw_block_idx != 1)
+                {
+                    for(j=0;j<sram_size;)
+                    {
+                        uint32_t value;
+                        ssv6xxx_sdio_read_reg(child, sram_addr, &value);
+                        fw_checksum = fw_checksum + value;
+                        sram_addr+=4;
+                        j+=4;
+                    }
+                }
+                if(fw_checksum != checksum)
+                {
+                    ret = -1;
+                    SSV_LOG_DBG("fail! checksum not match(0x%x <> 0x%x)\n", checksum, fw_checksum);
+                    goto out;
+                }
+            }
+#endif
+
+        }
+        SSV_LOG_DBG("checksum = 0x%x\n", checksum);
+        ret = 0;
+
+        if (0 == ret) // firmware check ok
+	        break;
+
+    }
+    while (--retry_count);
+
+out:
+    if (fw_buffer != NULL) {
+        kfree(fw_buffer);
+    }
+
+    if (openfile) {
+        if (fw_fp) {
+            ssv6xxx_close_firmware(fw_fp);
+        }
+    }
+
+    return ret;
+}
+
+extern char *cfgfirmwarepath;
+static int ssv6xxx_sdio_load_firmware_openfile(struct device *child)
+{
+    u8 firmware_name[SSV_FIRMWARE_PATH_MAX] = {0};
+    struct file *fp = NULL;
+    bool openfile = true;
+
+    //Populate full firmware name(path+name).
+    if (NULL != cfgfirmwarepath)
+    {
+        snprintf(firmware_name, SSV_FIRMWARE_PATH_MAX, "%s%s", cfgfirmwarepath,
+                 ssv_cfg.firmware_name);
+    }
+    else if (0x00 != ssv_cfg.firmware_path[0])
+    {
+        snprintf(firmware_name, SSV_FIRMWARE_PATH_MAX, "%s%s",
+                 ssv_cfg.firmware_path, ssv_cfg.firmware_name);
+    }
+    else
+    {
+        //It should not be entered here.
+        SSV_LOG_DBG("[%s][%d] error!!\n", __FUNCTION__, __LINE__);
+    }
+
+    SSV_LOG_DBG("Using firmware at %s\n", firmware_name);
+    //Check firmware exist.
+    fp = filp_open(firmware_name, O_RDONLY, 0);
+    if (IS_ERR(fp))
+    {
+        SSV_LOG_DBG("\033[0;31mFirmware not exist, change to load inside firmware.\033[0m\n");
+        openfile = false;
+    }
+    else
+    {
+        // SSV_LOG_DBG("Firmware exist...\n");
+        filp_close((struct file *)fp, NULL);
+    }
+
+    return _ssv6xxx_sdio_load_firmware(child, firmware_name, openfile);
+}
+
+
+static int ssv6xxx_sdio_load_firmware_fromheader(struct device *child)
+{
+    return _ssv6xxx_sdio_load_firmware(child, NULL, false);
+}
+
+static int ssv6xxx_sdio_force_load_fw_fromeheader(struct device *child)
+{
+    int ret = 0;
+
+#ifndef HWIF_DIS_FW_DOWNLOAD
+    //Jump to ROM before load firmware.
+    ssv6xxx_sdio_write_reg(child, 0x08c00004, 0x80000); //ROM code address 0x80000
+    //Disable CPU, Support after r4p0
+    //Stall C0
+    ssv6xxx_sdio_write_reg(child, 0x08c00014, 0xff010100);
+	//turn-on necessary memories
+    ssv6xxx_sdio_write_reg(child, 0x08d02050, 0xcfc3);
+    mdelay(500);
+
+    //load fw before platform initialize
+	//power on all sram
+    ssv6xxx_sdio_write_reg(child, 0x08d02050, 0xfffff);
+    ssv6xxx_sdio_write_reg(child, 0x08d02054, 0x3fff);
+#endif
+
+    ssv6xxx_sdio_load_fw_pre_config_hwif(child);
+
+    ret = ssv6xxx_sdio_load_firmware_fromheader(child);
+
+    if(ret)
+        return ret;
+    
+    ssv6xxx_sdio_load_fw_post_config_hwif(child);
+#ifndef HWIF_DIS_FW_DOWNLOAD
+	//set IVB
+    ssv6xxx_sdio_write_reg(child, 0x08c00004, 0x1000000);
+	//mask sdio before reset S0
+    ssv6xxx_sdio_write_reg(child, 0x08c00134, 0x100);
+    //S0_RST(0x08c00014), b[0]: RST_H, 1:reset S0 AHB
+	//reset S0
+    ssv6xxx_sdio_write_reg(child, 0x08c00014, 0xff000101);
+#ifdef HWIF_SET_PADMUX
+    //Before r4p0 need this.
+    ssv6xxx_sdio_write_reg(child, 0x08c00800, 0x7f80);
+    ssv6xxx_sdio_write_reg(child, 0x08c00804, 0x30);
+    ssv6xxx_sdio_write_reg(child, 0x08c00860, 0x31);
+    ssv6xxx_sdio_write_reg(child, 0x80000, 0xd500d5);
+#endif
+    mdelay(500); //Wait 500ms for firmware ready.
+#endif
+
+    return ret;
+}
+
+
+
+static int ssv6xxx_sdio_load_each_fw(struct device *child)
+{
+    int ret = 0;
+
+#ifndef HWIF_DIS_FW_DOWNLOAD
+    //Jump to ROM before load firmware.
+    ssv6xxx_sdio_write_reg(child, 0x08c00004, 0x80000); //ROM code address 0x80000
+    //Disable CPU, Support after r4p0
+    //Stall C0
+    ssv6xxx_sdio_write_reg(child, 0x08c00014, 0xff010100);
+       //turn-on necessary memories
+    ssv6xxx_sdio_write_reg(child, 0x08d02050, 0xcfc3);
+
+
+    //load fw before platform initialize
+       //power on all sram
+    ssv6xxx_sdio_write_reg(child, 0x08d02050, 0xfffff);
+    ssv6xxx_sdio_write_reg(child, 0x08d02054, 0x3fff);
+#endif
+
+    ssv6xxx_sdio_load_fw_pre_config_hwif(child);
+
+    if((NULL != cfgfirmwarepath) || (0x00 != ssv_cfg.firmware_path[0]))
+    {
+        ret = ssv6xxx_sdio_load_firmware_openfile(child);
+    }
+    else
+    {
+        ret = ssv6xxx_sdio_load_firmware_fromheader(child);
+    }
+
+    if(ret)
+        return ret;
+    
+    ssv6xxx_sdio_load_fw_post_config_hwif(child);
+#ifndef HWIF_DIS_FW_DOWNLOAD
+	//set IVB
+    ssv6xxx_sdio_write_reg(child, 0x08c00004, 0x1000000);
+	//mask sdio before reset S0
+    ssv6xxx_sdio_write_reg(child, 0x08c00134, 0x1100);
+    //S0_RST(0x08c00014), b[0]: RST_H, 1:reset S0 AHB
+	//reset S0
+    ssv6xxx_sdio_write_reg(child, 0x08c00014, 0xff000101);
+#ifdef HWIF_SET_PADMUX
+    //Before r4p0 need this.
+    ssv6xxx_sdio_write_reg(child, 0x08c00800, 0x7f80);
+    ssv6xxx_sdio_write_reg(child, 0x08c00804, 0x30);
+    ssv6xxx_sdio_write_reg(child, 0x08c00860, 0x31);
+    ssv6xxx_sdio_write_reg(child, 0x80000, 0xd500d5);
+#endif
+    mdelay(500); //Wait 500ms for firmware ready.
+#endif
+
+    return ret;
+}
+
+int ssv6xxx_sdio_configure_ipc_mem(struct device *child);
+static int ssv6xxx_sdio_load_fw(struct device *child)
+{
+    int ret;
+    int fw_temp = ssv_cfg.firmware_choice;
+
+    //shrink code size: 
+    //pre load engineer fw to setup rf_phy table and calibaration
+
+    ssv6xxx_sdio_configure_ipc_mem(child);
+        
+    ssv_cfg.firmware_choice = 2;
+    //load engineer fw first
+    ret = ssv6xxx_sdio_force_load_fw_fromeheader(child);
+    //ssv6xxx_sdio_save_calibr_result(child);
+    ssv_cfg.firmware_choice = fw_temp;
+    if (ret) 
+        return ret;
+
+    //load SMAC FW
+    ret = ssv6xxx_sdio_load_each_fw(child);
+    // if (!ret) 
+    //     ssv6xxx_sdio_restore_calibration(child);
+
+    return ret;
+
+}
+#endif
+
+////load firmware function ---
 
 static int ssv6xxx_sdio_irq_getstatus(struct device *child,int *status)
 {
@@ -628,7 +972,7 @@ static int ssv6xxx_sdio_irq_getstatus(struct device *child,int *status)
     struct ssv6xxx_sdio_glue *glue;
 
     struct sdio_func *func;
-    glue = dev_get_drvdata(child->parent);
+    glue = dev_get_drvdata(child);
 
     if (IS_GLUE_INVALID(glue))
 		return ret;
@@ -650,96 +994,72 @@ static void _sdio_hexdump(const u8 *buf,
                              size_t len)
 {
     size_t i;
-    printk("\n-----------------------------\n");
-    printk("hexdump(len=%lu):\n", (unsigned long) len);
+    SSV_LOG_DBG("\n-----------------------------\n");
+    SSV_LOG_DBG("hexdump(len=%lu):\n", (unsigned long) len);
     {
         for (i = 0; i < len; i++){
             
-            printk(" %02x", buf[i]);
+            SSV_LOG_DBG(" %02x", buf[i]);
             if((i+1)%40 ==0)
-                printk("\n");
+                SSV_LOG_DBG("\n");
         }
     }
-    printk("\n-----------------------------\n");
+    SSV_LOG_DBG("\n-----------------------------\n");
 }
 #endif
 
-static size_t ssv6xxx_sdio_get_readsz(struct device *child)
+static size_t _ssv6xxx_sdio_get_readsz(struct device *child)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func ;
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
+    struct sdio_func *func = NULL;
     size_t size = 0;
     int ret = -1;
-    u32 addr = SD_REG_BASE+REG_CARD_PKT_LEN_0;
-    u32 buf;
+#ifdef SDIO_CMD52_GET_RX_SIZE
+    u8 low_byte = 0;
+    u8 high_byte = 0;
+
+    func = dev_to_sdio_func(glue->dev);
+    sdio_claim_host(func);
+
+    low_byte = sdio_readb(func, 0xbc, &ret);
+    CHECK_IO_RET(glue, ret);
+    high_byte = sdio_readb(func, 0xbd, &ret);
+    CHECK_IO_RET(glue, ret);
+
+    sdio_release_host(func);
+
+    size = (size_t)((((u32)high_byte) << 8) | ((u32)low_byte));
+#else
+    //u32 addr = SD_REG_BASE+REG_CARD_PKT_LEN_0;
+    u32 addr = 0x08C100AC;
+    u32 buf = 0;
 
     func = dev_to_sdio_func(glue->dev);
     sdio_claim_host(func);
     
-    ret = glue->p_wlan_data->ops->readreg(child, addr, &buf);
+    ret = ssv6xxx_sdio_read_reg(child, addr, &buf);
     if (ret) {
-        dev_err(child->parent, "sdio read len failed ret[%d]\n",ret);
+        dev_err(child, "sdio read len failed ret[%d]\n",ret);
         size = 0;
     } else {
         size = (size_t)(buf&0xffff);
     }
 
     sdio_release_host(func);
+#endif
     return size;
 }
 
-static size_t ssv6xxx_sdio_get_aggr_readsz(struct device *child, int mode)
+static size_t ssv6xxx_sdio_get_aggr_readsz(struct device *child)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func ;
-#ifdef CONFIG_MMC_DISALLOW_STACK
-    u32 size = 0;
-    u32 *sizep = &glue->aggr_readsz;
-#else
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
-    PLATFORM_DMA_ALIGNED u32 size = 0;
-#else
-    u32 size = 0;
-#endif
-    u32 *sizep = &size;
-#endif
-    u32 buf = 0;
-    int ret = -1;
-    u32 tmp = 0;
-    
-    func = dev_to_sdio_func(glue->dev);
-    sdio_claim_host(func);
-
-    ret = sdio_memcpy_fromio(func, sizep, glue->dataIOPort, sizeof(u32)/* jmp_mpdu_len + accu_rx_len, total 4 bytes */);
-    if (ret) { 
-        dev_err(child->parent, "%s(): sdio read failed size ret[%d]\n", __func__, ret);
-        *sizep = 0;
-    }
-    
-    tmp = *sizep;
-    size = (*sizep >> 16); // accu_rx_len
-    sdio_release_host(func);
-    
-    if (0 == size) {
-        printk("dlen = 0, read 0xc1000010, orig value 0x%08x\n", tmp);
-        ret = glue->p_wlan_data->ops->readreg(child, 0xc1000010, &buf);
-        if (ret) {
-            printk("sdio read 0xc1000010 err %d\n", ret);
-            size = 0;
-        } else {
-            size = (size_t)(buf & 0xffff);
-            printk("read size = %d\n", (int)size);
-        }
-    }
-    
-    return (size_t)size;
+    return _ssv6xxx_sdio_get_readsz(child);
 }
 
-static int __must_check ssv6xxx_sdio_read(struct device *child,
-        void *buf, size_t *size, int mode)
+static int ssv6xxx_sdio_read(struct device *child,
+        void *buf, size_t *size)
 {
     int ret = (-1), readsize = 0;
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func ;
 
     if (IS_GLUE_INVALID(glue))
@@ -751,7 +1071,7 @@ static int __must_check ssv6xxx_sdio_read(struct device *child,
     readsize = sdio_align_size(func, *size);
 	ret = sdio_memcpy_fromio(func, buf, glue->dataIOPort, readsize);
     if (ret)
-        dev_err(child->parent, "%s(): sdio read failed size ret[%d]\n", __func__, ret);
+        dev_err(child, "%s(): sdio read failed size ret[%d]\n", __func__, ret);
 
     sdio_release_host(func);
     CHECK_IO_RET(glue, ret);
@@ -764,16 +1084,17 @@ static int __must_check ssv6xxx_sdio_read(struct device *child,
     return ret;
 }
 
-static int __must_check ssv6xxx_sdio_write(struct device *child,
-        void *buf, size_t len,u8 queue_num)
+static int ssv6xxx_sdio_write(struct device *child, void *buf, size_t len,u8 queue_num)
 {
     int ret = (-1);
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
     int writesize;
     void *tempPointer;
     struct sk_buff *skb = (struct sk_buff *)buf;
     size_t txlen, remaining = len;
+
+    (glue->tx_pkt)++;
 
     if (IS_GLUE_INVALID(glue))
 		return ret;
@@ -783,9 +1104,8 @@ static int __must_check ssv6xxx_sdio_write(struct device *child,
         func = dev_to_sdio_func(glue->dev);
         sdio_claim_host(func);
         while (remaining) {
-#ifdef CONFIG_FW_ALIGNMENT_CHECK
             if (((unsigned long)skb->data) & (PLATFORM_DEF_DMA_ALIGN_SIZE - 1)) {
-                //printk(KERN_ERR"SDIO Write: unalignmen!!!!!");
+                SSV_LOG_DBG("SDIO Write: unalignmen!!!!!\n");
                 if (remaining > SDIO_DMA_BUFFER_LEN) {
                     memcpy(glue->dmaData,skb->data, SDIO_DMA_BUFFER_LEN);
                     txlen = SDIO_DMA_BUFFER_LEN;
@@ -798,15 +1118,18 @@ static int __must_check ssv6xxx_sdio_write(struct device *child,
                 tempPointer = glue->dmaData;
             }
             else
-#endif
             {
                 tempPointer = skb->data;
                 txlen = remaining;
                 remaining = 0;
             }
 #if 0
-            if(len > 1500)
+            // if(len > 1500)
                 _sdio_hexdump(skb->data,len);
+#endif
+#if 0
+            SSV_LOG_DBG("[%s][%d] len = %d\n", __FUNCTION__, __LINE__, (int)len);
+            ssv_hex_dump(skb->data, len);
 #endif
             writesize = sdio_align_size(func, txlen);
             do
@@ -837,30 +1160,24 @@ static void ssv6xxx_sdio_irq_handler(struct sdio_func *func)
 {
     int status;
     struct ssv6xxx_sdio_glue *glue = sdio_get_drvdata(func);
-    struct ssv6xxx_platform_data *pwlan_data;
-
-    //dev_err(&func->dev, "ssv6xxx_sdio_irq_handler [%p] [%p]\n",func,glue);
-    //WARN_ON(glue == NULL);
 
     if (IS_GLUE_INVALID(glue))
         return;
 
-    pwlan_data = glue->p_wlan_data;
-
     if(glue->irq_handler != NULL)
     {
-        atomic_set(&pwlan_data->irq_handling, 1);
+        atomic_set(&glue->irq_handling, 1);
         sdio_release_host(func);
         status = glue->irq_handler(0, glue);
         sdio_claim_host(func);
-        atomic_set(&pwlan_data->irq_handling, 0);
+        atomic_set(&glue->irq_handling, 0);
     }
 }
 
 static void ssv6xxx_sdio_irq_setmask(struct device *child,int mask)
 {
     int err_ret;    
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
     
     if (IS_GLUE_INVALID(glue))
@@ -877,11 +1194,14 @@ static void ssv6xxx_sdio_irq_setmask(struct device *child,int mask)
     }
 }
 
+#if 1
 static void ssv6xxx_sdio_irq_trigger(struct device *child)
 {
     int err_ret;
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
+
+    SSV_LOG_DBG("ssv6xxx_sdio_irq_trigger\n");
 
     if (IS_GLUE_INVALID(glue))
 		return;
@@ -896,12 +1216,14 @@ static void ssv6xxx_sdio_irq_trigger(struct device *child)
         CHECK_IO_RET(glue, err_ret);
     }
 }
+#endif
 
+#if 0
 static int ssv6xxx_sdio_irq_getmask(struct device *child, u32 *mask)
 {
     u8 imask = 0;
     int ret = (-1);
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
 
     if (IS_GLUE_INVALID(glue))
@@ -918,25 +1240,22 @@ static int ssv6xxx_sdio_irq_getmask(struct device *child, u32 *mask)
     }
     return ret;
 }
-
+#endif
 
 static void ssv6xxx_sdio_irq_enable(struct device *child)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
     int ret;
-    struct ssv6xxx_platform_data *pwlan_data;
+
+    SSV_LOG_DBG("ssv6xxx_sdio_irq_enable\n");
 
     if (IS_GLUE_INVALID(glue))
         return;
 
-    pwlan_data = glue->p_wlan_data;
     func = dev_to_sdio_func(glue->dev);
 
     sdio_claim_host(func);
-
-    //printk("%s(): enable\n", __FUNCTION__);
-    //dev_err(&func->dev, "ssv6xxx_sdio_irq_enable\n");
 
     /* Register the isr */
     ret =  sdio_claim_irq(func, ssv6xxx_sdio_irq_handler);
@@ -949,27 +1268,25 @@ static void ssv6xxx_sdio_irq_enable(struct device *child)
 
 static void ssv6xxx_sdio_irq_disable(struct device *child, bool iswaitirq)
 {
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
-    struct ssv6xxx_platform_data *pwlan_data;
     int ret;
 
     //WARN_ON(true);
     if (IS_GLUE_INVALID(glue))
 		return;
 
-    HWIF_DBG_PRINT(glue->p_wlan_data, "ssv6xxx_sdio_irq_disable\n");
+    SSV_LOG_DBG("ssv6xxx_sdio_irq_disable\n");
     
-	pwlan_data = glue->p_wlan_data;
     func = dev_to_sdio_func(glue->dev);
     if (func == NULL) {
-        HWIF_DBG_PRINT(glue->p_wlan_data, "func == NULL\n");
+        SSV_LOG_DBG("func == NULL\n");
         return;
     }
         
     sdio_claim_host(func);
         
-    while (atomic_read(&pwlan_data->irq_handling)) {
+    while (atomic_read(&glue->irq_handling)) {
         sdio_release_host(func);
         schedule_timeout(HZ / 10);
         sdio_claim_host(func);
@@ -992,58 +1309,59 @@ static void ssv6xxx_sdio_recv_rx_func(struct ssv6xxx_sdio_glue *glue)
 	int ret = 0, readsize = 0, rx_cnt = 0;
 	size_t dlen;
 	u32 status = SSV6XXX_INT_RX;
-	u32 rx_mode = glue->p_wlan_data->rx_mode(glue->p_wlan_data->rx_mode_param);
-	u32 frame_size = (rx_mode & RX_HW_AGG_MODE) ? MAX_HCI_RX_AGGR_SIZE : MAX_FRAME_SIZE_DMG;
+	u32 frame_size = MAX_HCI_RX_AGGR_SIZE;
     
 	for (rx_cnt = 0 ; status & SSV6XXX_INT_RX ; rx_cnt++)
 	{
-		if (glue->is_rx_q_full(glue->rx_cb_args)) {
+		if (glue->is_rx_q_full && glue->is_rx_q_full(glue->rx_cb_args)) {
 			goto unmask;
 		}
 		
-		if (rx_mode == RX_NORMAL_MODE) {
-			dlen = ssv6xxx_sdio_get_readsz(&glue->core->dev);
-		} else {
-			dlen = ssv6xxx_sdio_get_aggr_readsz(&glue->core->dev, rx_mode);
-		}
-		
+		dlen = ssv6xxx_sdio_get_aggr_readsz(glue->dev);
         if ((dlen == 0) || (dlen > frame_size)) {
-			printk(KERN_ERR "%s(): dlen = %d, goto skip.\n", __func__, (int)dlen);
+			SSV_LOG_DBG("%s(): dlen = %d, goto skip.\n", __func__, (int)dlen);
 			goto unmask;
 		}
 	    
         sdio_claim_host(func);
         readsize = sdio_align_size(func, dlen);
         sdio_release_host(func);
-        rx_mpdu = glue->p_wlan_data->skb_alloc(glue->p_wlan_data->skb_param, readsize, GFP_KERNEL);
-
+        rx_mpdu = ssv_rx_skb_alloc(readsize, GFP_KERNEL);
         if (rx_mpdu == NULL) {
-			printk(KERN_ERR "%s(): Can't alloc skb.\n", __func__);
+			SSV_LOG_DBG("%s(): Can't alloc skb.\n", __func__);
 			goto unmask;
 		}
 		
-        ret = ssv6xxx_sdio_read(&glue->core->dev, rx_mpdu->data, &dlen, rx_mode);
+        ret = ssv6xxx_sdio_read(glue->dev, rx_mpdu->data, &dlen);
 		if (ret < 0) {
-			printk(KERN_ERR "%s(): Fail to sdio read %d\n", __FUNCTION__, ret);
-
-			glue->p_wlan_data->skb_free(glue->p_wlan_data->skb_param, rx_mpdu);
+			SSV_LOG_DBG("%s(): Fail to sdio read %d\n", __FUNCTION__, ret);
+            
+            ssv_rx_skb_free(rx_mpdu);
             goto unmask;
 		}
 		
-        skb_put(rx_mpdu, readsize);
-        (*glue->rx_pkt)++;
+        skb_put(rx_mpdu, dlen);
+        (glue->rx_pkt)++;
 
-		glue->rx_cb(rx_mpdu, glue->rx_cb_args);
+#if 0
+        SSV_LOG_DBG("[%s][%d] len = %d\n", __FUNCTION__, __LINE__, (int)rx_mpdu->len);
+        ssv_hex_dump(rx_mpdu->data, rx_mpdu->len);
+#endif
+        if (glue->rx_cb)
+		    glue->rx_cb(rx_mpdu, glue->rx_cb_args);
+        else
+            ssv_rx_skb_free(rx_mpdu);
+        
         if (0 != glue->recv_cnt) {
             if (rx_cnt > glue->recv_cnt)
                 break;
         }
 
-        ssv6xxx_sdio_irq_getstatus(&glue->core->dev, &status);
+        ssv6xxx_sdio_irq_getstatus(glue->dev, &status);
 	}
 
 unmask:
-	ssv6xxx_sdio_irq_setmask(&glue->core->dev, 0xff & ~SSV6XXX_INT_RX);
+	ssv6xxx_sdio_irq_setmask(glue->dev, 0xff & ~SSV6XXX_INT_RX);
 	return;
 }
 #endif //HWIF_SDIO_RX_IRQ
@@ -1057,25 +1375,19 @@ static void ssv6xxx_sdio_recv_rx_work(struct work_struct *work)
     int    ret = 0, rx_cnt = 0, readsize = 0;
     size_t dlen;
     u32    status = SSV6XXX_INT_RX;
-	u32    rx_mode = glue->p_wlan_data->rx_mode(glue->p_wlan_data->rx_mode_param);
-    u32    frame_size = (rx_mode & RX_HW_AGG_MODE) ? MAX_HCI_RX_AGGR_SIZE : MAX_FRAME_SIZE_DMG;
+    u32    frame_size = MAX_HCI_RX_AGGR_SIZE;
     
     for (rx_cnt = 0 ; status & SSV6XXX_INT_RX ; rx_cnt++)
     {
-        if (glue->is_rx_q_full(glue->rx_cb_args)) {
-            //printk("%s(): RX queue is full.\n", __func__);
+        if (glue->is_rx_q_full && glue->is_rx_q_full(glue->rx_cb_args)) {
+            //SSV_LOG_DBG("%s(): RX queue is full.\n", __func__);
             queue_work(glue->wq, (struct work_struct *)&glue->rx_work);
             goto skip;
         }
 
-        if (rx_mode == RX_NORMAL_MODE) {
-            dlen = ssv6xxx_sdio_get_readsz(&glue->core->dev);
-        } else {
-            dlen = ssv6xxx_sdio_get_aggr_readsz(&glue->core->dev, rx_mode);
-        }
-        
+        dlen = ssv6xxx_sdio_get_aggr_readsz(glue->dev);
         if ((dlen == 0) || (dlen > frame_size)) {
-            printk("%s(): dlen = %d, goto skip.\n", __func__, (int)dlen);
+            SSV_LOG_DBG("%s(): dlen = %d, goto skip.\n", __func__, (int)dlen);
             queue_work(glue->wq, (struct work_struct *)&glue->rx_work);
             goto skip;
         }
@@ -1083,37 +1395,39 @@ static void ssv6xxx_sdio_recv_rx_work(struct work_struct *work)
         sdio_claim_host(func);
         readsize = sdio_align_size(func, dlen);
         sdio_release_host(func);
-        rx_mpdu = glue->p_wlan_data->skb_alloc(glue->p_wlan_data->skb_param, readsize, GFP_KERNEL);
-        
+        rx_mpdu = ssv_rx_skb_alloc(readsize, GFP_KERNEL);
         if (rx_mpdu == NULL) {
-            printk("%s(): Can't alloc skb.\n", __func__);
+            SSV_LOG_DBG("%s(): Can't alloc skb.\n", __func__);
             queue_work(glue->wq, (struct work_struct *)&glue->rx_work);
             goto skip;
         }
        
-        ret = ssv6xxx_sdio_read(&glue->core->dev, rx_mpdu->data, &dlen, rx_mode);
+        ret = ssv6xxx_sdio_read(glue->dev, rx_mpdu->data, &dlen);
         if (ret < 0)
         {
-			printk(KERN_ERR "%s(): Fail to sdio read %d\n", __FUNCTION__, ret);
-
-			glue->p_wlan_data->skb_free(glue->p_wlan_data->skb_param, rx_mpdu);
+			SSV_LOG_DBG("%s(): Fail to sdio read %d\n", __FUNCTION__, ret);
+            ssv_rx_skb_free(rx_mpdu);
             goto unmask;
         }
 
-        skb_put(rx_mpdu, readsize);
-        (*glue->rx_pkt)++;
-
-        glue->rx_cb(rx_mpdu, glue->rx_cb_args);
+        skb_put(rx_mpdu, dlen);
+        (glue->rx_pkt)++;
+        
+        if (glue->rx_cb)
+            glue->rx_cb(rx_mpdu, glue->rx_cb_args);
+        else
+            ssv_rx_skb_free(rx_mpdu);
+            
         if (0 != glue->recv_cnt) {
             if (rx_cnt > glue->recv_cnt)
                 break;
         }
 
-        ssv6xxx_sdio_irq_getstatus(&glue->core->dev, &status);
+        ssv6xxx_sdio_irq_getstatus(glue->dev, &status);
     }
 
 unmask:
-    ssv6xxx_sdio_irq_setmask(&glue->core->dev, 0xff & ~SSV6XXX_INT_RX);
+    ssv6xxx_sdio_irq_setmask(glue->dev, 0xff & ~SSV6XXX_INT_RX);
 skip:
     return;
 }
@@ -1127,14 +1441,15 @@ static irqreturn_t ssv6xxx_sdio_isr(int irq, void *args)
     struct ssv6xxx_sdio_glue *glue = (struct ssv6xxx_sdio_glue *)args;
     int status = 0;
 
-    ssv6xxx_sdio_irq_getstatus(&glue->core->dev, &status);
+    ssv6xxx_sdio_irq_getstatus(glue->dev, &status);
 
     if (status & SSV6XXX_INT_RX) {
-        ssv6xxx_sdio_irq_setmask(&glue->core->dev, 0xff);
+        ssv6xxx_sdio_irq_setmask(glue->dev, 0xff);
 
 #ifdef HWIF_SDIO_RX_IRQ
 		ssv6xxx_sdio_recv_rx_func(glue);
 #else //HWIF_SDIO_RX_IRQ
+        // SSV_LOG_DBG("[%s][%d]\n", __FUNCTION__, __LINE__);
         //if (ssv_rx_use_wq) {
             queue_work(glue->wq, (struct work_struct *)&glue->rx_work);
         //} else {
@@ -1142,7 +1457,7 @@ static irqreturn_t ssv6xxx_sdio_isr(int irq, void *args)
         //}
 #endif //HWIF_SDIO_RX_IRQ
         
-        (*glue->rx_isr_cnt)++;
+        (glue->rx_isr_cnt)++;
         return IRQ_HANDLED;
     } else {
         return IRQ_NONE;
@@ -1151,20 +1466,22 @@ static irqreturn_t ssv6xxx_sdio_isr(int irq, void *args)
 
 static void ssv6xxx_sdio_irq_request(struct device *child, irq_handler_t irq_handler, void *irq_dev)
 {
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
     struct sdio_func *func;
-    bool isIrqEn = false;
+    bool isIrqEn = true;
 
     if (IS_GLUE_INVALID(glue))
 		return;
 
     func = dev_to_sdio_func(glue->dev);
 
-    //HWIF_DBG_PRINT(glue->p_wlan_data, "%s(): \n", __FUNCTION__);
     glue->irq_handler = irq_handler;
 
     if (isIrqEn)
     {
+        //add trigger
+        ssv6xxx_sdio_irq_trigger(child);
+        ssv6xxx_sdio_irq_setmask(glue->dev, 0xff & ~SSV6XXX_INT_RX);
         ssv6xxx_sdio_irq_enable(child);
     }
 }
@@ -1196,7 +1513,7 @@ static void ssv6xxx_sdio_read_parameter(struct sdio_func *func,
     err_ret = sdio_set_block_size(func,SDIO_DEF_BLOCK_SIZE);
 #endif
     if (err_ret != 0) {
-        printk("SDIO setting SDIO_DEF_BLOCK_SIZE fail!!\n");
+        SSV_LOG_DBG("SDIO setting SDIO_DEF_BLOCK_SIZE fail!!\n");
     }
 
     // output timing
@@ -1218,179 +1535,6 @@ static void ssv6xxx_sdio_read_parameter(struct sdio_func *func,
     sdio_release_host(func);
 }
 
-static void ssv6xxx_do_sdio_wakeup(struct sdio_func *func)
-{
-	int err_ret;
-	
-	if(func != NULL)
-	{
-		sdio_claim_host(func);
-		sdio_writeb(func, 0x01, REG_PMU_WAKEUP, &err_ret);
-		mdelay(10);
-		sdio_writeb(func, 0x00, REG_PMU_WAKEUP, &err_ret);
-		sdio_release_host(func);
-	}
-}
-
-static void ssv6xxx_sdio_pmu_wakeup(struct device *child)
-{
-	
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-	struct sdio_func *func;
-	if (glue != NULL) {
-		func = dev_to_sdio_func(glue->dev);
-		ssv6xxx_do_sdio_wakeup(func);
-
-	}
-}
-
-static bool ssv6xxx_sdio_support_scatter(struct device *child)
-{
-    bool support = false;
-
-    #if LINUX_VERSION_CODE > KERNEL_VERSION(3,0,0)
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func;
-        
-    do {
-        if (IS_GLUE_INVALID(glue)) {
-            dev_err(child, "ssv6xxx_sdio_enable_scatter glue == NULL!!!\n");
-            break;
-        }
-        
-        func = dev_to_sdio_func(glue->dev);                 
-        if (func->card->host->max_segs < MAX_SCATTER_ENTRIES_PER_REQ) {
-            dev_err(&func->dev, "host controller only supports scatter of :%d entries, driver need: %d\n",
-            func->card->host->max_segs,
-            MAX_SCATTER_ENTRIES_PER_REQ);
-            break;
-	    }
-        
-        support = true;
-    } while (0);
-    #endif
-
-    return support;
-}
-
-static void ssv6xxx_sdio_setup_scat_data(struct sdio_scatter_req *scat_req,
-					struct mmc_data *data)
-{
-	struct scatterlist *sg;
-	int i;
-    
-
-	data->blksz = SDIO_DEF_BLOCK_SIZE;
-	data->blocks = scat_req->len / SDIO_DEF_BLOCK_SIZE;
-
-	printk("scatter: (%s)  (block len: %d, block count: %d) , (tot:%d,sg:%d)\n",
-		   (scat_req->req & SDIO_WRITE) ? "WR" : "RD", 
-		   data->blksz, data->blocks, scat_req->len,
-		   scat_req->scat_entries);
-
-	data->flags = (scat_req->req & SDIO_WRITE) ? MMC_DATA_WRITE :
-						    MMC_DATA_READ;
-
-	/* fill SG entries */
-	sg = scat_req->sgentries;
-	sg_init_table(sg, scat_req->scat_entries);
-
-	/* assemble SG list */
-	for (i = 0; i < scat_req->scat_entries; i++, sg++) {
-		printk("%d: addr:0x%p, len:%d\n",
-			   i, scat_req->scat_list[i].buf,
-			   scat_req->scat_list[i].len);
-
-		sg_set_buf(sg, scat_req->scat_list[i].buf,
-			   scat_req->scat_list[i].len);
-	}
-
-	/* set scatter-gather table for request */
-	data->sg = scat_req->sgentries;
-	data->sg_len = scat_req->scat_entries;
-}
-
-static inline void ssv6xxx_sdio_set_cmd53_arg(u32 *arg, u8 rw, u8 func,
-					     u8 mode, u8 opcode, u32 addr,
-					     u16 blksz)
-{
-	*arg = (((rw & 1) << 31) |
-		((func & 0x7) << 28) |
-		((mode & 1) << 27) |
-		((opcode & 1) << 26) |
-		((addr & 0x1FFFF) << 9) |
-		(blksz & 0x1FF));
-}
-
-
-static int ssv6xxx_sdio_rw_scatter(struct device *child,
-			       struct sdio_scatter_req *scat_req)
-{   
-    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-    struct sdio_func *func;
-    
-	struct mmc_request mmc_req;
-	struct mmc_command cmd;
-	struct mmc_data data;
-    
-	
-	u8 opcode, rw;
-	int status = 1;
-
-	
-
-    do{
-
-        if(!glue){
-            dev_err(child, "ssv6xxx_sdio_enable_scatter glue == NULL!!!\n");
-            break;
-        }
-        
-        func = dev_to_sdio_func(glue->dev);
-
-//Scatter
-
-    	memset(&mmc_req, 0, sizeof(struct mmc_request));
-    	memset(&cmd, 0, sizeof(struct mmc_command));
-    	memset(&data, 0, sizeof(struct mmc_data));
-
-    	ssv6xxx_sdio_setup_scat_data(scat_req, &data);
-
-    	opcode = 0;//FIXED ADDRESS;
-
-    	rw = (scat_req->req & SDIO_WRITE) ? CMD53_ARG_WRITE : CMD53_ARG_READ;
-
-
-    	/* set command argument */
-    	ssv6xxx_sdio_set_cmd53_arg(&cmd.arg, rw, func->num,
-    				  CMD53_ARG_BLOCK_BASIS, opcode, glue->dataIOPort,
-    				  data.blocks);
-
-    	cmd.opcode = SD_IO_RW_EXTENDED;
-    	cmd.flags = MMC_RSP_SPI_R5 | MMC_RSP_R5 | MMC_CMD_ADTC;
-
-    	mmc_req.cmd = &cmd;
-    	mmc_req.data = &data;
-
-    	mmc_set_data_timeout(&data, func->card);
-    	/* synchronous call to process request */
-    	mmc_wait_for_req(func->card->host, &mmc_req);
-
-    	status = cmd.error ? cmd.error : data.error;
-
-
-        if (cmd.error)
-    		return cmd.error;
-    	if (data.error)
-    		return data.error;
-
-
-    }while(0);
-
-
-	return status;
-}
-
 /*
 static void ssv6xxx_set_bus_width(struct sdio_func *func, u32 bus_width)
 {
@@ -1398,7 +1542,7 @@ static void ssv6xxx_set_bus_width(struct sdio_func *func, u32 bus_width)
     u32 val = 0;
     u32 ret = 0;
     host = func->card->host;
-    printk("%s: set bus width %d\n", __FUNCTION__, bus_width);
+    SSV_LOG_DBG("%s: set bus width %d\n", __FUNCTION__, bus_width);
     sdio_claim_host(func);
     val = sdio_f0_readb(func, 0x07, &ret);
     if (ret == 0)
@@ -1419,7 +1563,7 @@ static void ssv6xxx_set_bus_width(struct sdio_func *func, u32 bus_width)
         }
         sdio_f0_writeb(func, val, 0x07, &ret);
         val = sdio_f0_readb(func, 0x07, &ret);
-        printk("%s: set bus width %d, val = %x\n", __FUNCTION__, bus_width, val);
+        SSV_LOG_DBG("%s: set bus width %d, val = %x\n", __FUNCTION__, bus_width, val);
     }
     if (ret == 0)
     {
@@ -1428,7 +1572,7 @@ static void ssv6xxx_set_bus_width(struct sdio_func *func, u32 bus_width)
     }
     else
     {
-        printk("%s: set bus width %d err\n", __FUNCTION__, bus_width);
+        SSV_LOG_DBG("%s: set bus width %d err\n", __FUNCTION__, bus_width);
     }
     mdelay(20);
     sdio_release_host(func);
@@ -1446,7 +1590,7 @@ static void ssv6xxx_set_sdio_clk(struct sdio_func *func, u32 sdio_hz)
 	else if (sdio_hz > host->f_max)
 		sdio_hz = host->f_max;
 
-	printk("%s: set sdio clk %dHz\n", __FUNCTION__, sdio_hz);
+	SSV_LOG_DBG("%s: set sdio clk %dHz\n", __FUNCTION__, sdio_hz);
 	sdio_claim_host(func);
 	host->ios.clock = sdio_hz;
 	host->ops->set_ios(host, &host->ios);
@@ -1466,232 +1610,22 @@ static void ssv6xxx_high_sdio_clk(struct sdio_func *func)
 #endif
 }
 
-static void ssv6xxx_sdio_reset(struct device *child)
-{
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-	struct sdio_func *func = dev_to_sdio_func(glue->dev);
-
-    if (IS_GLUE_INVALID(glue))
-		return;
-	   
-	HWIF_DBG_PRINT(glue->p_wlan_data, "%s\n", __FUNCTION__);
-    ssv6xxx_do_sdio_reset_reinit(glue->p_wlan_data, func, glue);
-}
-
-static int ssv6xxx_sdio_property(struct device *child)
-{
-	return SSV_HWIF_CAPABILITY_INTERRUPT | SSV_HWIF_INTERFACE_SDIO;
-}
-
-static void ssv6xxx_sdio_sysplf_reset(struct device *child, u32 addr, u32 value)
-{
-    int retval = 0; 
-    
-    retval = ssv6xxx_sdio_write_reg(child, addr, value);
-    if (retval)
-        printk("Fail to reset sysplf.\n");
-}
-
-static void ssv6xxx_sdio_cleanup(struct device *child)
-{
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-
-	if (IS_GLUE_INVALID(glue)) {
-		printk("%s(): glue is invalid!\n", __func__);
-		return;
-	}
-
-	HWIF_DBG_PRINT(glue->p_wlan_data, "%s(): \n", __FUNCTION__);
-
-    //if (ssv_rx_use_wq) {
-        cancel_work_sync((struct work_struct *)&glue->rx_work);
-    //} else {
-    //}
-}
-
 static void ssv6xxx_sdio_rx_task(struct device *child, 
 			int (*rx_cb)(struct sk_buff *rx_skb, void *args), 
-			int (*is_rx_q_full)(void *args), void *args, u32 *pkt, u32 *isr_cnt, u32 recv_cnt)
+			int (*is_rx_q_full)(void *args), void *args, u32 recv_cnt)
 {
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
+	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
 
 	glue->rx_cb = rx_cb;
 	glue->rx_cb_args = args;
 	glue->is_rx_q_full = is_rx_q_full;
-	glue->rx_pkt = pkt;
-    glue->rx_isr_cnt = isr_cnt;
     glue->recv_cnt = recv_cnt;
 
-    ssv6xxx_sdio_irq_setmask(&glue->core->dev, 0xff);
-    ssv6xxx_sdio_irq_disable(&glue->core->dev, false);
+    ssv6xxx_sdio_irq_setmask(glue->dev, 0xff);
+    ssv6xxx_sdio_irq_disable(glue->dev, false);
 
-    ssv6xxx_sdio_irq_request(&glue->core->dev, ssv6xxx_sdio_isr, NULL);
+    ssv6xxx_sdio_irq_request(glue->dev, ssv6xxx_sdio_isr, NULL);
 }
-
-#ifdef CONFIG_PM
-static int ssv6xxx_sdio_suspend_late(struct device *child)
-{
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-	struct sdio_func *func = dev_to_sdio_func(glue->dev);
-    int ret = 0;
-    mmc_pm_flag_t flags = sdio_get_host_pm_caps(func);
-
-    dev_info(glue->dev, "%s: suspend: PM flags = 0x%x\n",
-             sdio_func_id(func), flags);
-
-    if (!(flags & MMC_PM_KEEP_POWER))
-    {
-    	dev_err(&func->dev, "%s: cannot remain alive while host is suspended\n",
-                sdio_func_id(func));
-    	//return -ENOSYS;
-    }
-
-    if (flags & MMC_PM_KEEP_POWER) {
-        ret = sdio_set_host_pm_flags(func, MMC_PM_KEEP_POWER);
-        if (ret) {
-    	    dev_err(&func->dev, "set sdio keep pwr flag failed %d\n", ret);
-            return ret;
-        }
-    }
-
-    if (flags & MMC_PM_WAKE_SDIO_IRQ) {
-        ret = sdio_set_host_pm_flags(func, MMC_PM_WAKE_SDIO_IRQ);
-        if (ret) {
-    	    dev_err(&func->dev, "set sdio wake irq flag failed %d\n", ret);
-            return ret;
-        }
-    }
-
-    /*****************************************************************/
-    /*                                                               */
-    /* In SDIO clock always on case, lower SDIO clock can save power.*/
-    /*                                                               */
-    /*****************************************************************/
-
-    ssv6xxx_low_sdio_clk(func);
-
-    // ret = lbs_suspend(card->priv);
-    //if (ret)
-    //	return ret;
-
-    cancel_work_sync((struct work_struct *)&glue->rx_work);
-
-    HWIF_HAL_DISABLE_SDIO_RESET(glue);
-#if 0
-    sdio_claim_host(func);
-
-    ret = sdio_release_irq(func);
-    if (ret)
-        dev_err(&func->dev, "Failed to release sdio irq: %d\n", ret);
-
-    sdio_release_host(func);
-#endif
-    /*****************************************************************/
-    /*                                                               */
-    /* SDIO clock is about to down, so switch to async mode.         */
-    /* Only in async mode, DAT1 can be toggled without SDIO clock.   */
-    /*                                                               */
-    /*****************************************************************/
-
-    HWIF_HAL_ENABLE_SDIO_ASYNC_INT(glue);  // cmd52
-
-    /*****************************************************************/
-    /*                                                               */
-    /* The last step before suspend: Restore REG_PMU_WAKEUP to 0.    */
-    /* Turismo may suddenly fall asleep.                             */
-    /* Do all register read/write before this step.                  */
-    /* Set register 0xccb0b0f4=0 (ADR_PMU_RAM_13),                   */
-    /* If host is awake, register ccb0b0f4 will be set to 1,         */
-    /* FW will not enter sleep mode                                  */
-    /* the two registers must be together                            */
-    /*****************************************************************/
-    ret = __ssv6xxx_sdio_write_reg(glue, 0xccb0b0f4, 0x0);
-    _ssv6xxx_sdio_cmd52_write(glue, REG_PMU_WAKEUP, 0x0);
-
-    return ret;
-}
-static int ssv6xxx_sdio_resume_early(struct device *child)
-{
-	struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child->parent);
-	struct sdio_func *func = NULL;
-    int ret;
-
-    if (!glue)
-	    return 0;
-
-    dev_info(glue->dev, "%s: start.\n", __FUNCTION__);
-	func = dev_to_sdio_func(glue->dev);
-    /*****************************************************************/
-    /*                                                               */
-    /* The basic step before the first step: Enabling SDIO func 1    */
-    /*                                                               */
-    /*****************************************************************/
-    sdio_claim_host(func);
-    sdio_enable_func(func);
-    sdio_release_host(func);
-
-    /*****************************************************************/
-    /*                                                               */
-    /* The first step after resume: Set REG_PMU_WAKEUP to wakeup PMU.*/
-    /* Do all register read/write after this step.                   */
-    /* FW will check 0xccb0b0f4 (ADR_PMU_RAM_13) to keep awake       */
-    /* the two registers must be together */
-    /*****************************************************************/
-    _ssv6xxx_sdio_cmd52_write(glue, REG_PMU_WAKEUP, 0x1);
-    ret = __ssv6xxx_sdio_write_reg(glue, 0xccb0b0f4, 0x1);
-
-    /*****************************************************************/
-    /*                                                               */
-    /* SDIO clock is already up, so switch back to sync mode.        */
-    /*                                                               */
-    /*****************************************************************/
-
-    HWIF_HAL_DISABLE_SDIO_ASYNC_INT(glue);
-
-    /* Grab access to FN0 for ELP reg. */
-    func->card->quirks |= MMC_QUIRK_LENIENT_FN0;
-
-    /* Use block mode for transferring over one block size of data */
-    func->card->quirks |= MMC_QUIRK_BLKSZ_FOR_BYTE_MODE;
-
-    ssv6xxx_sdio_read_parameter(func, glue);
-
-    ssv6xxx_sdio_direct_int_mux_mode(glue, false);
-
-#if 0
-    sdio_claim_host(func);
-
-    //ret = sdio_release_irq(func);
-    //if (ret)
-    //    dev_err(&func->dev, "Failed to release sdio irq: %d\n", ret);
-    ret =  sdio_claim_irq(func, ssv6xxx_sdio_irq_handler);
-    if (ret)
-        dev_err(&func->dev, "Failed to claim sdio irq: %d\n", ret);
-
-    sdio_release_host(func);
-#endif
-
-    /*****************************************************************/
-    /*                                                               */
-    /* Set SDIO clock back to normal high freq.                      */
-    /*                                                               */
-    /*****************************************************************/
-
-    ssv6xxx_high_sdio_clk(func);
-
-    /*****************************************************************/
-    /*                                                               */
-    /* Finally, umask RX interrupt.                                  */
-    /*                                                               */
-    /*****************************************************************/
-
-    ssv6xxx_sdio_irq_setmask(&glue->core->dev, 0xff & ~SSV6XXX_INT_RX);
-
-    dev_info(glue->dev, "%s: end.\n", __FUNCTION__);
-
-    return 0;
-}
-#endif
 
 static void ssv6xxx_sdio_tx_req_cnt(struct device *dev, int *cnt)
 {
@@ -1699,52 +1633,129 @@ static void ssv6xxx_sdio_tx_req_cnt(struct device *dev, int *cnt)
     return;
 }
 
+static void ssv6xxx_sdio_tx_st(struct device *child, u32 *pkt_cnt)
+{
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
+
+    if (IS_GLUE_INVALID(glue)) {
+        SSV_LOG_DBG("%s(): glue is invalid!\n", __func__);
+        return;
+    }
+    *pkt_cnt = glue->tx_pkt;
+}
+
+static void ssv6xxx_sdio_rx_st(struct device *child, u32 *pkt_cnt)
+{
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
+
+    if (IS_GLUE_INVALID(glue)) {
+        SSV_LOG_DBG("%s(): glue is invalid!\n", __func__);
+        return;
+    }
+    *pkt_cnt = glue->rx_pkt;
+}
+
+static void ssv6xxx_sdio_fw_reset(struct device *child)
+{
+    int ret = -ENOMEM;
+    struct ssv6xxx_sdio_glue *glue = dev_get_drvdata(child);
+
+    if (IS_GLUE_INVALID(glue)) {
+        SSV_LOG_DBG("%s(): glue is invalid!\n", __func__);
+        return;
+    }
+
+#ifndef HWIF_DIS_FW_DOWNLOAD
+    //load fw before platform initialize
+    ret = ssv6xxx_sdio_load_fw(glue->dev);
+    if (ret) 
+    {
+        SSV_LOG_DBG("Fail to load firmware\n");
+        ret = -ENOMEM;
+    }
+#else
+    ssv6xxx_sdio_load_fw_post_config_hwif(glue->dev);
+#endif
+
+    // HCI_TX_PAGE_THRESHOLD_INT_FUNC(0x08c10088)
+    // b[7:0]:   TX_PAGE_LOW_THRESHOLD
+    // b[15:8]:  TX_PAGE_HIGH_THRESHOLD
+    // b[25:16]: TX_PAGE_OVER_THRESHOLD_EVENT_CNT
+    // b[30:26]: reseved
+    // b[31:     TX_PAGE_THRESHOLD_INT_EN
+    //ssv6xxx_sdio_write_reg(glue->dev, 0x08c10088, 0x8000280c);
+
+    //Set HCI path
+    {
+        #define CO_BIT_MASK(pos)                                (1UL<<(pos))
+        #define REG_HCI_BASE_ADDRESS                            (0x08C10000)
+        #define REG_HCI_CONTROL_REG_ADDRESS                     (REG_HCI_BASE_ADDRESS + 0x08)
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS    REG_HCI_CONTROL_REG_ADDRESS
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_SHIFT      (1)
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_MASK       CO_BIT_MASK(REG_HCI_CONTROL_REG_USB20_HOST_SELRW_SHIFT)
+        u32 tmp_regval = 0;
+        ssv6xxx_sdio_read_reg(glue->dev, REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS, &tmp_regval);
+        tmp_regval &= ~REG_HCI_CONTROL_REG_USB20_HOST_SELRW_MASK; //Set 0 for SDIO.
+        ssv6xxx_sdio_write_reg(glue->dev, REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS, tmp_regval);
+    }
+    {
+        //set HCI TX I/O aggr
+        //#define REG_HCI_BASE_ADDRESS                                                    (0x08C10000)
+        //#define REG_HCI_CONTROL_REG_ADDRESS                                             (REG_HCI_BASE_ADDRESS + 0x08) 
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_ADDRESS                           REG_HCI_CONTROL_REG_ADDRESS
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_SHIFT                             (0)
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_MASK                              CO_BIT_MASK(REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_SHIFT)
+        u32 tmp_regval = 0;
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08C10008, &tmp_regval);
+        if(ssv_cfg.hw_caps & HW_CAP_HCI_TX_AGGR) {
+            tmp_regval |= 0x01;
+        }
+        else {
+            tmp_regval &= ~0x01;
+        }
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08C10008, tmp_regval);
+    }    
+}
+
+#ifdef SSV_PERFORMANCE_WATCH
+static void ssv6xxx_sdio_get_info(struct device *child, struct ssv6xxx_hwif_info *info)
+{
+}
+
+static void ssv6xxx_sdio_clr_info(struct device *child)
+{
+}
+#endif
 static struct ssv6xxx_hwif_ops sdio_ops =
 {
     .read                  		= ssv6xxx_sdio_read,
     .write                 		= ssv6xxx_sdio_write,
     .readreg               		= ssv6xxx_sdio_read_reg,
     .writereg              		= ssv6xxx_sdio_write_reg,
-    .burst_readreg         		= ssv6xxx_sdio_burst_read_reg,
-    .burst_writereg        		= ssv6xxx_sdio_burst_write_reg,
-#ifdef ENABLE_WAKE_IO_ISR_WHEN_HCI_ENQUEUE
-    .trigger_tx_rx         		= ssv6xxx_sdio_trigger_tx_rx,
-#endif // ENABLE_WAKE_IO_ISR_WHEN_HCI_ENQUEUE
-    .irq_getmask           		= ssv6xxx_sdio_irq_getmask,
-    .irq_setmask           		= ssv6xxx_sdio_irq_setmask,
-    .irq_enable            		= ssv6xxx_sdio_irq_enable,
-    .irq_disable           		= ssv6xxx_sdio_irq_disable,
-    .irq_getstatus         		= ssv6xxx_sdio_irq_getstatus,
-    .irq_request           		= ssv6xxx_sdio_irq_request,
-    .irq_trigger           		= ssv6xxx_sdio_irq_trigger,
-    .pmu_wakeup            		= ssv6xxx_sdio_pmu_wakeup,
-    .load_fw               		= ssv6xxx_sdio_load_firmware,
-    .load_fw_pre_config_device 	= ssv6xxx_sdio_load_fw_pre_config_hwif,
-    .load_fw_post_config_device = ssv6xxx_sdio_load_fw_post_config_hwif,
+    .hwif_rx_task               = ssv6xxx_sdio_rx_task,
+    .get_tx_req_cnt             = ssv6xxx_sdio_tx_req_cnt,
+
+#if (HWIF_SUPPORT == 2)
     .cmd52_read            		= ssv6xxx_sdio_cmd52_read,
     .cmd52_write           		= ssv6xxx_sdio_cmd52_write,
-    .support_scatter       		= ssv6xxx_sdio_support_scatter,
-    .rw_scatter            		= ssv6xxx_sdio_rw_scatter,
-    .is_ready              		= ssv6xxx_is_ready,
-    .write_sram            		= ssv6xxx_sdio_write_sram,  
-    .interface_reset       		= ssv6xxx_sdio_reset, 
-    .property              		= ssv6xxx_sdio_property,
-    .hwif_rx_task               = ssv6xxx_sdio_rx_task,
-    .sysplf_reset       		= ssv6xxx_sdio_sysplf_reset,
-    .hwif_cleanup       		= ssv6xxx_sdio_cleanup,
-#ifdef CONFIG_PM
-    .hwif_suspend               = ssv6xxx_sdio_suspend_late, 
-    .hwif_resume                = ssv6xxx_sdio_resume_early, 
 #endif
-    .get_tx_req_cnt             = ssv6xxx_sdio_tx_req_cnt,
+//    .irq_trigger           		= ssv6xxx_sdio_irq_trigger,
+    .tx_st                      = ssv6xxx_sdio_tx_st,
+    .rx_st                      = ssv6xxx_sdio_rx_st,
+    .fw_reset           = ssv6xxx_sdio_fw_reset,
+#ifdef SSV_PERFORMANCE_WATCH
+    .get_info = ssv6xxx_sdio_get_info,
+    .clr_info = ssv6xxx_sdio_clr_info,
+#endif
 };
 
 
 #ifdef CONFIG_PCIEASPM
 #include <linux/pci.h>
-#if   (LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0))
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,26) && LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
 #include <linux/pci-aspm.h>
-#endif 
+#endif
 // Disable PCIe power saving mode to ensure correct operation of SDIO interface.
 static int cabrio_sdio_pm_check(struct sdio_func *func)
 {
@@ -1794,17 +1805,20 @@ static int cabrio_sdio_pm_check(struct sdio_func *func)
 }
 #endif // CONFIG_PCIEASPM
 
+int ssv6xxx_sdio_configure_ipc_mem(struct device *child)
+{
+    return ssv_configure_ipc_mem(child, &sdio_ops);
+}
 
-
-static int ssv6xxx_sdio_power_on(struct ssv6xxx_platform_data * pdata, struct sdio_func *func)
+static void ssv6xxx_sdio_power_on(struct ssv6xxx_sdio_glue *glue, struct sdio_func *func)
 {
 	
 	int ret = 0;
+    
+    if (glue->is_enabled == true)
+        return;
 
-	if (pdata->is_enabled == true)
-		return 0;
-
-    printk("ssv6xxx_sdio_power_on\n");
+    SSV_LOG_DBG("ssv6xxx_sdio_power_on\n");
 
 	sdio_claim_host(func);
 	ret = sdio_enable_func(func);
@@ -1812,8 +1826,7 @@ static int ssv6xxx_sdio_power_on(struct ssv6xxx_platform_data * pdata, struct sd
 	
 	
 	if (ret) {
-		printk("Unable to enable sdio func: %d)\n", ret);		
-		return ret;
+		SSV_LOG_DBG("Unable to enable sdio func: %d)\n", ret);		
 	}
 	
 	/*
@@ -1821,10 +1834,7 @@ static int ssv6xxx_sdio_power_on(struct ssv6xxx_platform_data * pdata, struct sd
 	 * 10 ms but let's be conservative here.
 	 */
 	msleep(10);
-
-	pdata->is_enabled = true;
-
-	return ret;
+    glue->is_enabled = true;
 }
 
 static int ssv6xxx_do_sdio_init_seq_5537(struct sdio_func *func) {
@@ -1842,7 +1852,7 @@ static int ssv6xxx_do_sdio_init_seq_5537(struct sdio_func *func) {
  
     if (status != 0) {
         //error handling
-        printk("%s(): The 1st CMD5 failed.", __func__);
+        SSV_LOG_DBG("%s(): The 1st CMD5 failed.", __func__);
         return -1;
     }
  
@@ -1857,7 +1867,7 @@ static int ssv6xxx_do_sdio_init_seq_5537(struct sdio_func *func) {
  
     if (status != 0) {
         //error handling
-        printk("%s(): The 2nd CMD5 failed.", __func__);
+        SSV_LOG_DBG("%s(): The 2nd CMD5 failed.", __func__);
         return -1;
     }
  
@@ -1874,7 +1884,7 @@ static int ssv6xxx_do_sdio_init_seq_5537(struct sdio_func *func) {
         func->card->rca = cmd.resp[0] >> 16;
     } else {
         //error handling
-        printk("%s(): CMD3 failed.", __func__);
+        SSV_LOG_DBG("%s(): CMD3 failed.", __func__);
         return -1;
     }
  
@@ -1890,29 +1900,30 @@ static int ssv6xxx_do_sdio_init_seq_5537(struct sdio_func *func) {
 
     if (status != 0) {
         //error handling
-        printk("%s(): CMD7 failed.", __func__);
+        SSV_LOG_DBG("%s(): CMD7 failed.", __func__);
         return -1;
     }
 
     return 0;
 }
 
-static void ssv6xxx_do_sdio_reset_reinit(struct ssv6xxx_platform_data *pwlan_data, 
-        struct sdio_func *func, struct ssv6xxx_sdio_glue *glue)
+static void ssv6xxx_do_sdio_reset_reinit(struct sdio_func *func, struct ssv6xxx_sdio_glue *glue)
 {
     int err_ret;
     struct mmc_host *host;
 
     if (IS_GLUE_INVALID(glue)) {
-        printk("%s(): glue is invalid.\n", __func__);
+        SSV_LOG_DBG("%s(): glue is invalid.\n", __func__);
         return;
     }
 
+#ifndef HWIF_DIS_FW_DOWNLOAD
     // Do reset by sdio cccr06 bit3
     sdio_claim_host(func);
     sdio_f0_writeb(func, 0x08, SDIO_CCCR_ABORT, &err_ret);
     sdio_release_host(func);
     CHECK_IO_RET(glue, err_ret);
+#endif
 
     // Do 5-5-3-7
     err_ret = ssv6xxx_do_sdio_init_seq_5537(func);
@@ -1921,19 +1932,27 @@ static void ssv6xxx_do_sdio_reset_reinit(struct ssv6xxx_platform_data *pwlan_dat
     // Set host bus width
     sdio_claim_host(func);
     host = func->card->host;
+#ifdef SDIO_USE_ONE_BIT
+    host->ios.bus_width = MMC_BUS_WIDTH_1;
+#else
     host->ios.bus_width = MMC_BUS_WIDTH_4;
+#endif
     host->ops->set_ios(host, &host->ios);
     mdelay(20);
     sdio_release_host(func);
 
     // Set card bus width
     sdio_claim_host(func);
+#ifdef SDIO_USE_ONE_BIT
+    sdio_f0_writeb(func, SDIO_BUS_WIDTH_1BIT, SDIO_CCCR_IF, &err_ret);
+#else
     sdio_f0_writeb(func, SDIO_BUS_WIDTH_4BIT, SDIO_CCCR_IF, &err_ret);
+#endif
     sdio_release_host(func);
     CHECK_IO_RET(glue, err_ret);
 
     // Enable func #1 and set block size
-    ssv6xxx_sdio_power_on(pwlan_data, func);
+    ssv6xxx_sdio_power_on(glue, func);
     ssv6xxx_sdio_read_parameter(func, glue);
 }
 
@@ -1966,75 +1985,18 @@ static void ssv6xxx_sdio_direct_int_mux_mode(struct ssv6xxx_sdio_glue *glue, boo
     }
 }
 
-static int ssv6xxx_sdio_power_off(struct ssv6xxx_platform_data * pdata, struct sdio_func *func)
+static void ssv6xxx_sdio_power_off(struct ssv6xxx_sdio_glue *glue, struct sdio_func *func)
 {
-	int ret;
+    if (glue->is_enabled == false)
+        return;
 
-	if (pdata->is_enabled == false)
-		return 0;
-    
-    printk("ssv6xxx_sdio_power_off\n");
-
+    SSV_LOG_DBG("ssv6xxx_sdio_power_off\n");
 	/* Disable the card */
 	sdio_claim_host(func);
-	ret = sdio_disable_func(func);
+	sdio_disable_func(func);
 	sdio_release_host(func);
 
-	if (ret)
-		return ret;
-
-	pdata->is_enabled = false;
-
-	return ret;
-}
-
-static void _read_chip_id (struct ssv6xxx_sdio_glue *glue)
-{
-    u32 regval;
-    int ret;
-    u8 _chip_id[SSV6XXX_CHIP_ID_LENGTH];
-    u8 *c = _chip_id;
-    int i = 0;
-
-    //CHIP ID
-    // Chip ID registers should be common to all SSV6xxx devices. So these registers 
-    // must not come from ssv6xxx_reg.h but defined somewhere else.
-    ret = __ssv6xxx_sdio_read_reg(glue, ADR_CHIP_ID_3, &regval);
-    *((u32 *)&_chip_id[0]) = __be32_to_cpu(regval);
-
-    if (ret == 0)
-        ret = __ssv6xxx_sdio_read_reg(glue, ADR_CHIP_ID_2, &regval);
-    *((u32 *)&_chip_id[4]) = __be32_to_cpu(regval);
-
-    if (ret == 0)
-        ret = __ssv6xxx_sdio_read_reg(glue, ADR_CHIP_ID_1, &regval);
-    *((u32 *)&_chip_id[8]) = __be32_to_cpu(regval);
-
-    if (ret == 0)
-        ret = __ssv6xxx_sdio_read_reg(glue, ADR_CHIP_ID_0, &regval);
-    *((u32 *)&_chip_id[12]) = __be32_to_cpu(regval);
-
-    _chip_id[12+sizeof(u32)] = 0;
-
-    // skip null for turimo fpga chip_id bug)
-    while (*c == 0) {
-        i++;
-        c++;
-        if (i == 16) { // max string length reached.
-            c = _chip_id;
-            break;
-        }
-    }
-
-    if (*c != 0) {
-        strncpy(glue->tmp_data.chip_id, c, SSV6XXX_CHIP_ID_LENGTH);
-        dev_info(glue->dev, "CHIP ID: %s \n", glue->tmp_data.chip_id);
-        strncpy(glue->tmp_data.short_chip_id, c, SSV6XXX_CHIP_ID_SHORT_LENGTH);
-        glue->tmp_data.short_chip_id[SSV6XXX_CHIP_ID_SHORT_LENGTH] = 0;
-    } else {
-        dev_err(glue->dev, "Failed to read chip ID");
-        glue->tmp_data.chip_id[0] = 0;
-    }   
+    glue->is_enabled = false;
 }
 
 #if (defined(CONFIG_SSV_SDIO_INPUT_DELAY) && defined(CONFIG_SSV_SDIO_OUTPUT_DELAY))
@@ -2066,7 +2028,7 @@ static void ssv6xxx_sdio_delay_chain(struct sdio_func *func, u32 input_delay, u3
             delay[i] |= ((out_delay-1) << SDIO_OUTPUT_DELAY_LEVEL_SFT);
     }
 
-    printk("%s: delay chain data0[%02x], data1[%02x], data2[%02x], data3[%02x]\n", 
+    SSV_LOG_DBG("%s: delay chain data0[%02x], data1[%02x], data2[%02x], data3[%02x]\n", 
         __FUNCTION__, delay[0], delay[1], delay[2], delay[3]);
 
     //set sdio delay value
@@ -2079,6 +2041,41 @@ static void ssv6xxx_sdio_delay_chain(struct sdio_func *func, u32 input_delay, u3
 }
 #endif
 
+static int ssv6xxx_sdio_set_xtal(struct device *dev, u32 xtal)
+{
+    //(16M/24M/26M/40M/12M/20M/25M)
+    
+    u32 value = 0;
+    ssv6xxx_sdio_read_reg(dev, 0x08d01014, &value);
+    value = value&0xffffeff0;
+    
+    switch(xtal)
+    {  
+        case 24:
+            value |= 1; 
+            break;
+        case 25:
+            value |= 6;
+            value |= 0x1000;
+            break;
+        case 26:
+            value |= 2; 
+            value |= 0x1000;
+            break;
+        case 40:
+            value |= 3;
+            break;
+        default:
+            value |= 2; 
+            value |= 0x1000;
+            break;
+    }
+
+    ssv6xxx_sdio_write_reg(dev, 0x08d01014, value);
+    return 0;
+}
+
+extern int ssv6xxx_platform_init(struct device *dev, struct ssv6xxx_hwif_ops *hwif_ops, void **plat_hw);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
 static int __devinit ssv6xxx_sdio_probe(struct sdio_func *func,
         const struct sdio_device_id *id)
@@ -2087,28 +2084,27 @@ static int ssv6xxx_sdio_probe(struct sdio_func *func,
         const struct sdio_device_id *id)
 #endif
 {
-    struct ssv6xxx_platform_data *pwlan_data;
     struct ssv6xxx_sdio_glue     *glue;
-
-    //struct resource res[1];
-    //mmc_pm_flag_t mmcflags;
+    void *plat_hw = NULL;
     int ret = -ENOMEM;
 
-    printk(KERN_INFO "=======================================\n");
-    printk(KERN_INFO "==           RUN SDIO                ==\n");
-    printk(KERN_INFO "=======================================\n");
+    SSV_LOG_INFO("=======================================\n");
+    SSV_LOG_INFO("==           RUN SDIO                ==\n");
+    SSV_LOG_INFO("=======================================\n");
     
-
     /* We are only able to handle the wlan function */
-    if (func->num != 0x01)
-        return -ENODEV;
+    if (func->num != 0x01) {
+        ret = -ENODEV;
+        goto out;
+    }
 
-    printk("max block count: %u\n", min(func->card->host->max_blk_count, 511u));
-
+    SSV_LOG_DBG("vendor = 0x%x device = 0x%x\n", func->vendor, func->device);
+    SSV_LOG_DBG("max block count: %u\n", min(func->card->host->max_blk_count, 511u));
     glue = kzalloc(sizeof(*glue), GFP_KERNEL);
     if (!glue)
     {
         dev_err(&func->dev, "can't allocate glue\n");
+        ret = -ENOMEM;
         goto out;
     }
 
@@ -2119,15 +2115,13 @@ static int ssv6xxx_sdio_probe(struct sdio_func *func,
 		glue->wq = create_singlethread_workqueue("ssv6xxx_sdio_wq");
 		if (!glue->wq) {
 			dev_err(&func->dev, "Could not allocate Work Queue\n");
-			goto out;
+            ret = -ENOMEM;
+            goto err_crate_wq;
 		}
 	//} else {
 	//	tasklet_init(&glue->rx_tasklet, ssv6xxx_sdio_recv_rx_tasklet, (unsigned long)glue);
 	//}
 
-    /* Tell PM core that we don't need the card to be powered now */
-    //pm_runtime_put_noidle(&func->dev);
-    
     /* 
      * Setting SDIO delay chain
      * Note: delay chain function cannot work in CABRIO 
@@ -2138,125 +2132,188 @@ static int ssv6xxx_sdio_probe(struct sdio_func *func,
     //Setting SDIO to 25M
 	ssv6xxx_low_sdio_clk(func);
 
-    pwlan_data = &glue->tmp_data;
-    memset(pwlan_data, 0, sizeof(struct ssv6xxx_platform_data));
-   
-    atomic_set(&pwlan_data->irq_handling, 0);
-    
+    atomic_set(&glue->irq_handling, 0);
     glue->dev = &func->dev;
-    //init_waitqueue_head(&glue->irq_wq);
 
     /* Grab access to FN0 for ELP reg. */
     func->card->quirks |= MMC_QUIRK_LENIENT_FN0;
-
     /* Use block mode for transferring over one block size of data */
     func->card->quirks |= MMC_QUIRK_BLKSZ_FOR_BYTE_MODE;
 
-    glue->dev_ready = true;
-    /* if sdio can keep power while host is suspended, enable wow */
-    //mmcflags = sdio_get_host_pm_caps(func);
-    //dev_err(glue->dev, "sdio PM caps = 0x%x\n", mmcflags);
-/*
-    if (mmcflags & MMC_PM_KEEP_POWER)
-        pwlan_data->pwr_in_suspend = true;
-*/
-    //store sdio vendor/device id
-    pwlan_data->vendor = func->vendor;
-    pwlan_data->device = func->device;
-
-    dev_err(glue->dev, "vendor = 0x%x device = 0x%x\n",
-            pwlan_data->vendor, pwlan_data->device);
     #ifdef CONFIG_PCIEASPM
     cabrio_sdio_pm_check(func);
     #endif // CONFIG_PCIEASPM
-    pwlan_data->ops = &sdio_ops;
 
-    sdio_set_drvdata(func, glue);
-
-#ifdef CONFIG_PM
-    /*
-        Some platforms LDO-EN can not be pulled down. WIFI cause leakage.
-        Avoid leakage issues
-    */
-#if 0
-    ssv6xxx_do_sdio_wakeup(func);
-#endif
-#endif
-
-    ssv6xxx_sdio_power_on(pwlan_data, func);
-    
+    ssv6xxx_sdio_power_on(glue, func);
     ssv6xxx_sdio_read_parameter(func, glue);
 
+	glue->dev_ready = true;
     //do system reset from sdio client   
-    ssv6xxx_do_sdio_reset_reinit(pwlan_data, func, glue);
+    ssv6xxx_do_sdio_reset_reinit(func, glue);
     ssv6xxx_sdio_direct_int_mux_mode(glue, false);
     //ssv6xxx_set_bus_width(func, MMC_BUS_WIDTH_4);
 
-    /* Tell PM core that we don't need the card to be powered now */
-    //pm_runtime_put_noidle(&func->dev);
-    _read_chip_id(glue);
+    sdio_set_drvdata(func, glue);
 
-    glue->core = platform_device_alloc(pwlan_data->short_chip_id, -1);
-    if (!glue->core)
+#ifdef HWIF_TRIM_CODE
+
+/* The trim code rule:
+ * +-------------+
+ * |Set | DLDO_LV|
+ * +----+--------+
+ * |000 | 011    |
+ * |001 | 010    |
+ * |010 | 001    |
+ * |011 | 000    |
+ * |100 | 111    |
+ * |101 | 110    |
+ * |110 | 101    |
+ * |111 | 100    |
+ * +-------------+
+ */
+#define REG_TRIM_ADDR               (0x8500000+4)
+#define REG_PMU_DLDO_AND_DCDC_ADDR  (0x08d01010)
+#define REG_DLDO_LV_OFS             (3)
+#define REG_DLDO_LV_MSK             (0x38)
+#define REG_TRIM_OFS                (29)
+#define REG32_R(ADDR, val)          (ssv6xxx_sdio_read_reg(glue->dev, ADDR, val))
+#define REG32_W(ADDR, val)          (ssv6xxx_sdio_write_reg(glue->dev, ADDR, val))
+#define REG_TRIM_MSK                (0xE0000000)
+    do {
+        u32 _regval, _hw_val;
+        REG32_R(REG_TRIM_ADDR, &_regval);
+        REG32_R(REG_PMU_DLDO_AND_DCDC_ADDR, &_hw_val);
+        _hw_val = ((_hw_val) & (~REG_DLDO_LV_MSK)) | ((((_regval >> REG_TRIM_OFS) & 0x7) ^ 0x3) << REG_DLDO_LV_OFS);
+        //SSV_LOG_DBG("trim code write 0x%x\n", _hw_val);
+        REG32_W(REG_PMU_DLDO_AND_DCDC_ADDR, _hw_val);
+    } while(0);
+#endif
+
+    //pll
+    { 
+        u32 value;
+        u32 count=0;
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08c00008, 0x01010000);
+        
+        ssv6xxx_sdio_set_xtal(glue->dev, ssv_cfg.xtal_clock);
+        //SSV_LOG_DBG("xtal_clock = %d\n", ssv_cfg.xtal_clock);
+        
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08d01004, &value);
+        //SSV_LOG_DBG("addr(0x08d01004) = 0x%x\n", value);
+        value |= 0x80000000;
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08d01004, value);
+        //ssv6xxx_sdio_read_reg(glue->dev, 0x08d01004, &value);
+        //SSV_LOG_DBG("addr(0x08d01004) = 0x%x\n", value);
+
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08d0208c, &value);
+        while( ( (value&0x40000000) >>30) != 1)  
+        {
+            count++;
+            if(count >= 100)
+            {  
+                SSV_LOG_DBG("wait... 0x%x\n", value);
+                break;
+            }
+            ssv6xxx_sdio_read_reg(glue->dev, 0x08d0208c, &value);
+        }
+
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08d01018, &value);
+        //SSV_LOG_DBG("addr(0x08d01018) = 0x%x\n", value);
+        value |= 0x10000;
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08d01018, value);        
+        
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08c00010, &value);
+        //SSV_LOG_DBG("addr(0x08c00010) = 0x%x\n", value);
+        value = 1;
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08c00010, value);         
+
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08c00008, 0x00010101);
+    }
+
+#ifndef HWIF_DIS_FW_DOWNLOAD
+    //load fw before platform initialize
+
+    ret = ssv6xxx_sdio_load_fw(glue->dev);
+    if (ret) 
     {
-        dev_err(glue->dev, "can't allocate platform_device");
+        SSV_LOG_DBG("Fail to load firmware\n");
         ret = -ENOMEM;
-        goto out_free_glue;
+        goto err_crate_wq;
     }
+#else
+    ssv6xxx_sdio_load_fw_post_config_hwif(glue->dev);
+#endif
 
-    glue->core->dev.parent = &func->dev;
+    // HCI_TX_PAGE_THRESHOLD_INT_FUNC(0x08c10088)
+    // b[7:0]:   TX_PAGE_LOW_THRESHOLD
+    // b[15:8]:  TX_PAGE_HIGH_THRESHOLD
+    // b[25:16]: TX_PAGE_OVER_THRESHOLD_EVENT_CNT
+    // b[30:26]: reseved
+    // b[31:     TX_PAGE_THRESHOLD_INT_EN
+    ssv6xxx_sdio_write_reg(glue->dev, 0x08c10088, 0x8000280c);
 
-    //dev_err(glue->dev, "sdio ssv6xxx_sdio_probe device[%08x] parent[%08x]\n",&glue->core->dev,&func->dev);
-
-    /*
-    	memset(res, 0x00, sizeof(res));
-
-    	res[0].start = pwlan_data->irq;
-    	res[0].flags = IORESOURCE_IRQ;
-    	res[0].name = "irq";
-
-    	ret = platform_device_add_resources(glue->core, res, ARRAY_SIZE(res));
-    	if (ret) {
-    		dev_err(glue->dev, "can't add resources\n");
-    		goto out_dev_put;
-    	}
-    */    
-    ret = platform_device_add_data(glue->core, pwlan_data,
-                                   sizeof(*pwlan_data));
-    if (ret)
+    //Set HCI path
     {
-        dev_err(glue->dev, "can't add platform data\n");
-        goto out_dev_put;
+        #define CO_BIT_MASK(pos)                                (1UL<<(pos))
+        #define REG_HCI_BASE_ADDRESS                            (0x08C10000)
+        #define REG_HCI_CONTROL_REG_ADDRESS                     (REG_HCI_BASE_ADDRESS + 0x08)
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS    REG_HCI_CONTROL_REG_ADDRESS
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_SHIFT      (1)
+        #define REG_HCI_CONTROL_REG_USB20_HOST_SELRW_MASK       CO_BIT_MASK(REG_HCI_CONTROL_REG_USB20_HOST_SELRW_SHIFT)
+        u32 tmp_regval = 0;
+        ssv6xxx_sdio_read_reg(glue->dev, REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS, &tmp_regval);
+        tmp_regval &= ~REG_HCI_CONTROL_REG_USB20_HOST_SELRW_MASK; //Set 0 for SDIO.
+        ssv6xxx_sdio_write_reg(glue->dev, REG_HCI_CONTROL_REG_USB20_HOST_SELRW_ADDRESS, tmp_regval);
     }
 
-    glue->p_wlan_data = glue->core->dev.platform_data;
-
-    /* Initialize ssv6xxx HWIF HAL layer function*/
-    if ((ret = HWIF_HAL_INIT(glue)) != 0) {
-        goto out_dev_put;
+    {
+        //set HCI TX I/O aggr
+        //#define REG_HCI_BASE_ADDRESS                                                    (0x08C10000)
+        //#define REG_HCI_CONTROL_REG_ADDRESS                                             (REG_HCI_BASE_ADDRESS + 0x08) 
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_ADDRESS                           REG_HCI_CONTROL_REG_ADDRESS
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_SHIFT                             (0)
+        //#define REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_MASK                              CO_BIT_MASK(REG_HCI_CONTROL_REG_HCI_TX_AGG_EN_BIT_SHIFT)
+        u32 tmp_regval = 0;
+        ssv6xxx_sdio_read_reg(glue->dev, 0x08C10008, &tmp_regval);
+        if(ssv_cfg.hw_caps & HW_CAP_HCI_TX_AGGR) {
+            tmp_regval |= 0x01;
+        }
+        else {
+            tmp_regval &= ~0x01;
+        }
+        ssv6xxx_sdio_write_reg(glue->dev, 0x08C10008, tmp_regval);
     }
 
-    ssv6xxx_sdio_irq_setmask(&glue->core->dev,0xff);
     
-    ret = platform_device_add(glue->core);
-    if (ret)
-    {
-        dev_err(glue->dev, "can't add platform device\n");
-        goto out_dev_put;
+    // mask rx interrupt
+    ssv6xxx_sdio_irq_setmask(glue->dev,0xff);
+
+    //add trigger
+    ssv6xxx_sdio_irq_trigger(glue->dev);
+	
+    ret = ssv6xxx_platform_init(&func->dev, &sdio_ops, &plat_hw);
+    if (ret) {
+        SSV_LOG_DBG("Fail to platform init\n");
+        ret = -ENOMEM;
+        goto err_plat_init;
     }
-
+    glue->plat_hw = plat_hw;
+    
     return 0;
-
-out_dev_put:
-    platform_device_put(glue->core);
-
-out_free_glue:
-    if (glue != NULL)
+    
+err_plat_init:
+    if (glue) {
+        cancel_work_sync((struct work_struct *)&glue->rx_work);
+	    destroy_workqueue(glue->wq);
+    }
+err_crate_wq:
+    if (glue)
         kfree(glue);
 out:
     return ret;
 }
 
+extern void ssv6xxx_platform_deinit(void *plat_hw);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
 static void __devexit ssv6xxx_sdio_remove(struct sdio_func *func)
 #else
@@ -2265,37 +2322,23 @@ static void ssv6xxx_sdio_remove(struct sdio_func *func)
 {
     struct ssv6xxx_sdio_glue *glue = sdio_get_drvdata(func);
 
-    printk("ssv6xxx_sdio_remove..........\n");
-    
-    /* Undo decrement done above in ssv6xxx_probe */
-    //pm_runtime_get_noresume(&func->dev);
-
-    
+    SSV_LOG_DBG("ssv6xxx_sdio_remove..........\n");
     if ( glue )
     {
+        // step 1, netstack deinit
+        ssv6xxx_platform_deinit(glue->plat_hw);
+        
+        // step 2, sdio driver deinit
         // Remove IRQ handler once card is removed.
-        printk("ssv6xxx_sdio_remove - ssv6xxx_sdio_irq_disable\n");
-        ssv6xxx_sdio_irq_disable(&glue->core->dev,false);
-        // Mark device is not ready for access.
-        glue->dev_ready = false;
-#if 0
-        ssv6xxx_dev_remove(glue->dev);
-#endif
-
+        SSV_LOG_DBG("ssv6xxx_sdio_remove - ssv6xxx_sdio_irq_disable\n");
+        ssv6xxx_sdio_irq_disable(glue->dev, false);
         //Setting SDIO to 25M
 		ssv6xxx_low_sdio_clk(func);
+        SSV_LOG_DBG("ssv6xxx_sdio_remove - disable mask\n");
+        ssv6xxx_sdio_irq_setmask(glue->dev, 0xff);
 
-        printk("ssv6xxx_sdio_remove - disable mask\n");
-        ssv6xxx_sdio_irq_setmask(&glue->core->dev,0xff);
+        ssv6xxx_sdio_power_off(glue, func);
 
-        ssv6xxx_sdio_power_off(glue->p_wlan_data, func);
-
-        printk("platform_device_del \n");
-        platform_device_del(glue->core);
-
-        printk("platform_device_put \n");
-        platform_device_put(glue->core);
-                   
 	    //if (ssv_rx_use_wq) {
             cancel_work_sync((struct work_struct *)&glue->rx_work);
 	    	destroy_workqueue(glue->wq);
@@ -2303,11 +2346,13 @@ static void ssv6xxx_sdio_remove(struct sdio_func *func)
 	    	//tasklet_kill(&glue->rx_tasklet);
 	    //}
 
+        glue->dev_ready = false;
         kfree(glue);
     }
+    
     sdio_set_drvdata(func, NULL);
 
-    printk("ssv6xxx_sdio_remove leave..........\n");
+    SSV_LOG_DBG("ssv6xxx_sdio_remove leave..........\n");
 }
 
 #ifdef CONFIG_PM
@@ -2352,13 +2397,13 @@ EXPORT_SYMBOL(ssv6xxx_sdio_driver);
 
 int ssv6xxx_sdio_init(void)
 {
-    printk(KERN_INFO "ssv6xxx_sdio_init\n");
+    SSV_LOG_DBG("ssv6xxx_sdio_init\n");
     return sdio_register_driver(&ssv6xxx_sdio_driver);
 }
 
 void ssv6xxx_sdio_exit(void)
 {
-    printk(KERN_INFO "ssv6xxx_sdio_exit\n");
+    SSV_LOG_DBG("ssv6xxx_sdio_exit\n");
     sdio_unregister_driver(&ssv6xxx_sdio_driver);
 }
 EXPORT_SYMBOL(ssv6xxx_sdio_init);
