@@ -45,6 +45,7 @@
 /* Define these values to match devices */
 #define USB_SSV_VENDOR_ID  0x8065
 #define USB_SSV_PRODUCT_ID 0x6011
+#define USB_SSV_PRODUCT_ID_ALT 0x6000
 
 // #define MAX_USB_RX_AGGR_SIZE        (3072)
 #define MAX_USB_RX_AGGR_SIZE        (20*1024) //HCI RX sync from FW max size.
@@ -63,6 +64,7 @@
 /* table of devices that work with this driver */
 static const struct usb_device_id ssv_usb_table[] = {
     { USB_DEVICE(USB_SSV_VENDOR_ID, USB_SSV_PRODUCT_ID) },
+    { USB_DEVICE(USB_SSV_VENDOR_ID, USB_SSV_PRODUCT_ID_ALT) },
     { }                 
 };
 MODULE_DEVICE_TABLE(usb, ssv_usb_table);
